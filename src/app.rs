@@ -33,6 +33,9 @@ use crate::trashing;
 use crate::treemap::{self, TreemapMotion};
 use crate::watch;
 
+#[path = "app/cleanup_panel.rs"]
+mod cleanup_panel;
+
 actions!(petal, [GoUp, OpenFolder, Rescan, StartOver, ShowSunburst, ShowIcicle, ShowTreemap, ReadAsAdmin]);
 
 const BG: u32 = 0x1c1d21;
@@ -740,6 +743,7 @@ enum Access {
 
 pub struct Petal {
     screen: Screen,
+    cleanup_panel: cleanup_panel::PanelState,
     focus_handle: FocusHandle,
     error: Option<String>,
     /// A short confirmation at the bottom of the window; `notice_version` lets a newer
@@ -765,6 +769,7 @@ impl Petal {
         let access = if std::env::var_os("PETAL_HIDE_ACCESS").is_some() { Access::Dismissed } else { access };
         let mut this = Self {
             screen: Screen::Start(scan::volumes()),
+            cleanup_panel: cleanup_panel::PanelState::new(cx),
             focus_handle,
             error: None,
             notice: None,
@@ -775,6 +780,7 @@ impl Petal {
             color_by: ColorBy::Folder,
             chart: ChartType::Sunburst,
         };
+        this.start_cleanup_scheduler(cx);
         if access == Access::Missing {
             this._access_watch = Some(this.watch_access(cx));
         }
@@ -865,6 +871,8 @@ impl Petal {
     }
 
     fn start_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if self.cleanup_panel.executing() { return; }
+        self.invalidate_cleanup_jobs();
         self.error = None;
         onboarding::mark_first_run_done();
         let progress = Arc::new(Progress::default());
@@ -972,6 +980,8 @@ impl Petal {
     }
 
     fn cancel_scan(&mut self, cx: &mut Context<Self>) {
+        if self.cleanup_panel.executing() { return; }
+        self.invalidate_cleanup_jobs();
         if let Screen::Scanning(scanning) = &self.screen {
             scanning.progress.cancelled.store(true, Ordering::Relaxed);
         }
@@ -1034,6 +1044,7 @@ impl Petal {
 
     /// Read changed folders again in the background. Returns false once these results are gone.
     fn check_changes(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        if self.cleanup_panel.executing() { return true; }
         let Some(r) = self.results() else { return false };
         if r.id != id {
             return false;
@@ -1043,6 +1054,7 @@ impl Petal {
             return true;
         }
         let pending = watch.take();
+        let was_out_of_date = r.out_of_date;
         if pending.lost && !r.out_of_date {
             r.out_of_date = true;
             cx.notify();
@@ -1072,6 +1084,10 @@ impl Petal {
             }
         }
         if folders.is_empty() {
+            if r.out_of_date && !was_out_of_date {
+                self.invalidate_cleanup_jobs();
+                cx.notify();
+            }
             return true;
         }
         let tree = &r.tree;
@@ -1087,6 +1103,9 @@ impl Petal {
         let root = tree.root_path.clone();
         let startup = r.requested_root == std::path::Path::new("/");
         r.refreshing = true;
+        // Stop metadata evaluation as soon as a rescan begins, not only after splice.
+        self.invalidate_cleanup_jobs();
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let (fresh, errors, volumes) = cx
                 .background_spawn(async move {
@@ -1119,6 +1138,8 @@ impl Petal {
     /// Read the folders the scan couldn't, as an administrator (macOS asks for a password),
     /// and fold them into the results.
     fn read_as_admin(&mut self, cx: &mut Context<Self>) {
+        if self.cleanup_panel.cleanup_busy { return; }
+        self.invalidate_cleanup_jobs();
         let Some(r) = self.results() else { return };
         if r.admin == AdminRead::Reading {
             return;
@@ -1227,6 +1248,7 @@ impl Petal {
     /// Delete the startup disk's Time Machine snapshots (macOS asks for a password), then
     /// say what that freed.
     fn delete_snapshots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup_panel.cleanup_busy { return; }
         let Some(r) = self.results() else { return };
         if r.deleting_snapshots {
             return;
@@ -1422,6 +1444,7 @@ impl Petal {
     /// `volumes`: the startup disk as it is now, read in the background, when that's what was
     /// scanned.
     fn splice(&mut self, fresh: Vec<(usize, scan::Fresh)>, errors: u64, volumes: Option<scan::StartupVolumes>, cx: &mut Context<Self>) {
+        self.invalidate_cleanup_jobs();
         let Some(r) = self.results() else { return };
         let touched: Vec<usize> = fresh.iter().map(|(ix, _)| *ix).collect();
         let focus_path = path_to(&r.tree, r.focus);
@@ -1498,6 +1521,7 @@ impl Petal {
         r.collector_version += 1;
         r.collector_frees.set(None);
         let version = r.collector_version;
+        let results_id = r.id;
         let paths: Vec<PathBuf> = r.collector.iter().map(|&ix| r.tree.path_of(ix)).collect();
         if paths.is_empty() {
             r.collector_frees.set(Some(0));
@@ -1507,7 +1531,7 @@ impl Petal {
             let frees = cx.background_spawn(async move { scan::frees_of(&paths) }).await;
             this.update(cx, |this, cx| {
                 if let Some(r) = this.results() {
-                    if r.collector_version == version {
+                    if r.id == results_id && r.collector_version == version {
                         r.collector_frees.set(Some(frees));
                         cx.notify();
                     }
@@ -1670,6 +1694,7 @@ impl Petal {
     }
 
     fn trash_collected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup_panel.cleanup_busy { return; }
         let Some(r) = self.results() else { return };
         if r.collector.is_empty() {
             return;
@@ -1696,6 +1721,8 @@ impl Petal {
             format!("{} items", format_count(items.len() as u64))
         };
         let frees = r.collector_frees.get().unwrap_or_else(|| r.collected_size());
+        let results_id = r.id;
+        let collector_version = r.collector_version;
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
@@ -1708,18 +1735,22 @@ impl Petal {
                 return;
             }
             let started = this.update(cx, |this, cx| {
-                if let Some(r) = this.results() {
-                    r.trashing = true;
-                    cx.notify();
-                }
+                if this.cleanup_panel.cleanup_busy { return false; }
+                let Some(r) = this.results() else { return false };
+                if r.id != results_id || r.collector_version != collector_version || r.trashing { return false; }
+                r.trashing = true;
+                this.invalidate_cleanup_jobs();
+                cx.notify();
+                true
             });
-            if started.is_err() {
+            if !matches!(started, Ok(true)) {
                 return;
             }
             let result = cx
                 .background_spawn(async move { trashing::move_to_trash(&paths) })
                 .await;
             this.update(cx, |this, cx| {
+                if !matches!(&this.screen, Screen::Results(r) if r.id == results_id) { return; }
                 if let Some(r) = this.results() {
                     r.trashing = false;
                 }
@@ -1768,10 +1799,14 @@ impl Petal {
 
 impl Render for Petal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match &self.screen {
-            Screen::Start(volumes) => self.render_start(volumes, cx).into_any_element(),
-            Screen::Scanning(scanning) => self.render_scanning(scanning, cx).into_any_element(),
-            Screen::Results(_) => self.render_results(window, cx).into_any_element(),
+        let content = if self.cleanup_panel.open {
+            self.render_cleanup_panel(cx).into_any_element()
+        } else {
+            match &self.screen {
+                Screen::Start(volumes) => self.render_start(volumes, cx).into_any_element(),
+                Screen::Scanning(scanning) => self.render_scanning(scanning, cx).into_any_element(),
+                Screen::Results(_) => self.render_results(window, cx).into_any_element(),
+            }
         };
 
         div()
@@ -1963,6 +1998,16 @@ impl Petal {
                 }
             });
 
+        bar = bar.child(button("cleanup-panel", if self.cleanup_panel.open { "规则与 AI · 返回图表" } else { "规则与 AI" })
+            .flex_shrink_0()
+            .on_click(cx.listener(|this, _, window, cx| {
+                window.focus(&this.focus_handle, cx);
+                this.cleanup_panel.open = !this.cleanup_panel.open;
+                cx.notify();
+            })));
+        if self.cleanup_panel.open {
+            return bar.child(div().min_w_0().truncate().child("扫描仍在后台继续"));
+        }
         match &self.screen {
             Screen::Results(r) => {
                 let can_go_up = r.tree.nodes[r.focus].parent.is_some();
@@ -2679,7 +2724,12 @@ impl Petal {
                             ),
                     )
                     .when(is_hovered && node.kind != Kind::Other, |d| {
-                        d.child(
+                        d.child(button(("ai-explain-row", ix), "解释").text_xs()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.explain_cleanup_node(ix, window, cx);
+                            })))
+                        .child(
                             icon_button(("reveal", ix), "⌕", "Reveal in Finder").on_click(cx.listener(
                                 move |_, _, _, cx| {
                                     cx.stop_propagation();

@@ -225,6 +225,33 @@ impl Walker<'_> {
         entry.is_dir && !entry.dataless && !self.skip.contains(path) && self.allowed_devices.contains(&entry.dev)
     }
 
+    /// Resolve only paths the main walk can reach. Follow the scan root as before, but
+    /// below it require each component to be listed, admissible and opened no-follow.
+    /// Keep the final fd so a prescan cannot reopen through a replaced ancestor.
+    fn hotspot_reachable(&self, root: &Path, path: &Path) -> Option<dirlist::Dir> {
+        let relative = path.strip_prefix(root).ok()?;
+        if relative.as_os_str().is_empty() {
+            return None;
+        }
+        let mut dir = dirlist::Dir::open(root).ok()?;
+        let mut at = root.to_path_buf();
+        for component in relative.components() {
+            if self.progress.cancelled.load(Ordering::Relaxed) {
+                return None;
+            }
+            let std::path::Component::Normal(name) = component else { return None };
+            let name = name.to_str()?;
+            let listing = dir.list(&at, false).ok()?;
+            let entry = listing.entries.iter().find(|entry| entry.name == name)?;
+            at.push(name);
+            if !self.admissible_dir(&at, entry) {
+                return None;
+            }
+            dir = dir.open_at(name).ok()?;
+        }
+        Some(dir)
+    }
+
     /// Outline pass: list the top `depth_left` levels breadth-first so every folder there
     /// is named on screen at once. Records structure only; the main walk counts the bytes.
     fn outline(&self, path: &Path, live: &LiveNode, depth_left: usize) {
@@ -250,6 +277,8 @@ impl Walker<'_> {
             .par_iter()
             .filter_map(|(path, category)| {
                 let relative = path.strip_prefix(root).ok()?;
+                // Revalidate after selection; ancestors can change while other tasks run.
+                let dir = self.hotspot_reachable(root, path)?;
                 // Attach to the live tree at the same node the main walk will use.
                 let mut live = self.progress.live.clone();
                 let mut depth = 0;
@@ -262,21 +291,28 @@ impl Walker<'_> {
                 // Read the folder's own allocation now (the same attribute its parent's listing
                 // reports), so its total is exact, and final, as soon as this pass ends.
                 let own = dirlist::dir_alloc(path).unwrap_or(0);
-                let raw = self.walk_dir(None, path, display_name(path), own, &live, depth);
-                if depth <= LIVE_DEPTH {
-                    live.done.store(true, Ordering::Release);
-                }
-                // Publish the exact size straight away, as a finding.
-                self.progress.early_findings.lock().unwrap().push(findings::Early {
-                    category: *category,
-                    path: path.clone(),
-                    size: raw.size,
-                    at_ms: self.progress.started.get().map(|s| s.elapsed().as_millis() as u64).unwrap_or(0),
-                });
-                Some((path.clone(), raw))
+                let raw = self.walk_dir_opening(path, display_name(path), own, &live, depth, |_| Ok(dir));
+                self.publish_prescan(path, *category, raw, &live, depth)
             })
             .collect();
         self.prescanned.lock().unwrap().extend(results);
+    }
+
+    fn publish_prescan(&self, path: &Path, category: usize, raw: Raw, live: &LiveNode, depth: usize) -> Option<(PathBuf, Raw)> {
+        // A cancelled walk returns a partial Raw, not an exact, completed finding.
+        if self.progress.cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        if depth <= LIVE_DEPTH {
+            live.done.store(true, Ordering::Release);
+        }
+        self.progress.early_findings.lock().unwrap().push(findings::Early {
+            category,
+            path: path.to_path_buf(),
+            size: raw.size,
+            at_ms: self.progress.started.get().map(|s| s.elapsed().as_millis() as u64).unwrap_or(0),
+        });
+        Some((path.to_path_buf(), raw))
     }
 
     /// `live` is this directory's own live node if it is within `LIVE_DEPTH`, else its
@@ -290,6 +326,24 @@ impl Walker<'_> {
         live: &LiveNode,
         depth: usize,
     ) -> Raw {
+        self.walk_dir_opening(path, name, own, live, depth, |name| {
+            // Relative open is the fast path; fall back to the full path (e.g. on EMFILE).
+            match parent {
+                Some(parent) => parent.open_at(name).or_else(|_| dirlist::Dir::open(path)),
+                None => dirlist::Dir::open(path),
+            }
+        })
+    }
+
+    fn walk_dir_opening(
+        &self,
+        path: &Path,
+        name: String,
+        own: u64,
+        live: &LiveNode,
+        depth: usize,
+        open: impl FnOnce(&str) -> std::io::Result<dirlist::Dir>,
+    ) -> Raw {
         if self.progress.cancelled.load(Ordering::Relaxed) {
             return Raw { name, size: 0, kind: Kind::Dir, items: 0, children: Vec::new() };
         }
@@ -299,12 +353,7 @@ impl Walker<'_> {
         }
         self.progress.dirs.fetch_add(1, Ordering::Relaxed);
 
-        // Relative open is the fast path; fall back to the full path (e.g. on EMFILE).
-        let dir = match parent {
-            Some(parent) => parent.open_at(&name).or_else(|_| dirlist::Dir::open(path)),
-            None => dirlist::Dir::open(path),
-        };
-        let listing = dir.and_then(|dir| dir.list(path, false).map(|listing| (dir, listing)));
+        let listing = open(&name).and_then(|dir| dir.list(path, false).map(|listing| (dir, listing)));
         let (dir, entries) = match listing {
             Ok((dir, listing)) => {
                 if listing.errors > 0 {
@@ -369,11 +418,6 @@ impl Walker<'_> {
         }
         let own_live = (depth <= LIVE_DEPTH).then(|| parent_live.child(&entry.name));
         let live = own_live.as_deref().unwrap_or(parent_live);
-        if self.prescanned_paths.contains(&path) {
-            if let Some(raw) = self.prescanned.lock().unwrap().remove(&path) {
-                return Some(raw);
-            }
-        }
         if entry.dataless {
             // Its contents live in the cloud and take no space here; don't make macOS fetch them.
             self.progress.cloud_only.fetch_add(1, Ordering::Relaxed);
@@ -383,6 +427,11 @@ impl Walker<'_> {
                 own.done.store(true, Ordering::Release);
             }
             return Some(Raw { name: entry.name, size: entry.size, kind: Kind::Dir, items: 0, children: Vec::new() });
+        }
+        if self.prescanned_paths.contains(&path) {
+            if let Some(raw) = self.prescanned.lock().unwrap().remove(&path) {
+                return Some(raw);
+            }
         }
         let raw = self.walk_dir(dir, &path, entry.name, entry.size, live, depth);
         if let Some(own) = &own_live {
@@ -528,7 +577,7 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
     walker.prescanned_paths = hotspots.into_iter().map(|(path, _)| path).collect();
     progress.hotspots_done_ms.store(elapsed_ms().max(1), Ordering::Relaxed);
     let raw = walker.walk_dir(None, root, display_name(root), own, &progress.live, 0);
-    debug_assert!(walker.prescanned.lock().unwrap().is_empty(), "a hotspot was never spliced in");
+    let raw = finalize_walk(&mut walker, root, raw);
     let flatten_start = std::time::Instant::now();
 
     let mut nodes = Vec::new();
@@ -548,6 +597,48 @@ fn scan_with_bases(root: &Path, progress: &Progress, bases: &findings::Bases) ->
         hardlinks,
         ..Default::default()
     }
+}
+
+/// Called only after both parallel passes have joined: no scan task may still write
+/// to the counters or live nodes being replaced here. Cancellation discards the tree
+/// in the UI, so it must never pay for recovery. A mutable filesystem is not an invariant.
+fn finalize_walk(walker: &mut Walker, root: &Path, raw: Raw) -> Raw {
+    let progress = walker.progress;
+    if progress.cancelled.load(Ordering::Relaxed) {
+        walker.prescanned.get_mut().unwrap().clear();
+        walker.prescanned_paths.clear();
+        progress.early_findings.lock().unwrap().clear();
+        return raw;
+    }
+    let remaining = walker.prescanned.get_mut().unwrap();
+    if remaining.is_empty() {
+        return raw;
+    }
+    // Local console diagnostics only. Bound both the sample and each rendered path;
+    // don't manufacture unreadable entries for paths absent from the returned tree.
+    eprintln!("petal: {} hotspots were not spliced (filesystem changed or became inaccessible); falling back to one full scan without hotspots", remaining.len());
+    for path in remaining.keys().take(20) {
+        let sample: String = path.to_string_lossy().chars().take(512).collect();
+        eprintln!("  unspliced hotspot: {sample:?}");
+    }
+    remaining.clear();
+    // Release the abandoned tree before allocating its replacement on a large scan.
+    drop(raw);
+    walker.prescanned_paths.clear();
+    walker.hardlinks.get_mut().unwrap().clear();
+    for counter in [&progress.files, &progress.bytes, &progress.dirs, &progress.errors, &progress.cloud_only] {
+        counter.store(0, Ordering::Relaxed);
+    }
+    progress.unreadable.lock().unwrap().clear();
+    progress.early_findings.lock().unwrap().clear();
+    progress.live.reset();
+    *progress.current.lock().unwrap() = "Rescanning without hotspots".to_string();
+    // Keep the scan's start/watch time and nonzero phase markers: recovery belongs
+    // to the same scan, not a new schedule. Rebuild the cheap outline for the GUI.
+    walker.outline(root, &progress.live, OUTLINE_DEPTH);
+    let own = fs::symlink_metadata(root).as_ref().map(disk_size).unwrap_or(0);
+    // Deliberately no finalize/retry recursion, even if the filesystem changes again.
+    walker.walk_dir(None, root, display_name(root), own, &progress.live, 0)
 }
 
 /// What deleting these paths would actually free, walking them with APFS clone reporting
@@ -630,16 +721,7 @@ fn hotspots(root: &Path, bases: &findings::Bases, walker: &Walker) -> Vec<(PathB
         if path == root || !path.starts_with(root) || found.iter().any(|(f, _)| path.starts_with(f) || f.starts_with(&path)) {
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-        let dataless = {
-            use std::os::macos::fs::MetadataExt as _;
-            meta.st_flags() & 0x4000_0000 != 0
-        };
-        if !meta.is_dir() || dataless || !walker.allowed_devices.contains(&meta.dev()) {
-            continue;
-        }
-        // Only folders the walk itself would skip matter, i.e. those below the scan root.
-        if path.ancestors().take_while(|a| *a != root).any(|a| walker.skip.contains(a)) {
+        if walker.hotspot_reachable(root, &path).is_none() {
             continue;
         }
         found.push((path, category));
@@ -1102,6 +1184,318 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!("petal-scan-regression-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path.canonicalize().unwrap()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create fixture: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RestorePermissions(PathBuf, fs::Permissions);
+
+    impl RestorePermissions {
+        fn deny(path: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let restore = Self(path.to_path_buf(), fs::metadata(path).unwrap().permissions());
+            fs::set_permissions(path, fs::Permissions::from_mode(0)).unwrap();
+            restore
+        }
+    }
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+
+    fn home_bases(home: &Path) -> findings::Bases {
+        findings::Bases { home: Some(home.to_path_buf()), user_temp: None, protected: Vec::new() }
+    }
+
+    fn main_walk(walker: &Walker, root: &Path) -> Raw {
+        walker.walk_dir(None, root, display_name(root), disk_size(&fs::symlink_metadata(root).unwrap()), &walker.progress.live, 0)
+    }
+
+    fn raw_tree(root: &Path, raw: Raw) -> Tree {
+        let mut nodes = Vec::new();
+        flatten(raw, None, &mut nodes);
+        Tree { root_path: root.to_path_buf(), nodes, ..Default::default() }
+    }
+
+    fn prescan(walker: &mut Walker, root: &Path, bases: &findings::Bases) {
+        let selected = hotspots(root, bases, walker);
+        assert!(!selected.is_empty());
+        walker.prescan_hotspots(root, &selected);
+        walker.prescanned_paths = selected.into_iter().map(|(path, _)| path).collect();
+        assert!(!walker.prescanned.lock().unwrap().is_empty());
+    }
+
+    fn assert_recovery_matches_plain(walker: &Walker, root: &Path, recovered: Raw) {
+        let tree = raw_tree(root, recovered);
+        let progress = walker.progress;
+        let plain_progress = Progress::default();
+        let plain = scan_with_bases(root, &plain_progress, &findings::Bases::default());
+        assert_eq!(fingerprint(&tree), fingerprint(&plain));
+        assert_eq!(progress.errors.load(Ordering::Relaxed), plain.errors);
+        assert_eq!(progress.cloud_only.load(Ordering::Relaxed), plain.cloud_only);
+        assert_eq!(*progress.unreadable.lock().unwrap(), plain.unreadable);
+        for (actual, expected) in [(&progress.files, &plain_progress.files), (&progress.bytes, &plain_progress.bytes), (&progress.dirs, &plain_progress.dirs)] {
+            assert_eq!(actual.load(Ordering::Relaxed), expected.load(Ordering::Relaxed));
+        }
+        let live = crate::live::snapshot(&progress.live, root, None).tree;
+        assert_eq!(live.nodes[0].size, tree.nodes[0].size);
+        assert_eq!(live.nodes[0].items, tree.nodes[0].items);
+        let mut live_dirs: Vec<_> = live.nodes.iter().enumerate().map(|(ix, _)| live.path_of(ix)).collect();
+        let mut tree_dirs: Vec<_> = tree.nodes.iter().enumerate().filter(|(_, node)| node.kind == Kind::Dir).map(|(ix, _)| tree.path_of(ix)).collect();
+        live_dirs.sort();
+        tree_dirs.sort();
+        assert_eq!(live_dirs, tree_dirs);
+        assert!(progress.early_findings.lock().unwrap().is_empty());
+        assert!(walker.prescanned.lock().unwrap().is_empty());
+        assert!(walker.prescanned_paths.is_empty());
+    }
+
+    #[test]
+    fn hotspot_symlink_ancestor_is_not_prescanned() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let root = fixture.0.join("root");
+        let outside = fixture.0.join("outside");
+        write(&outside.join("Caches/shared.bin"), 32768);
+        fs::create_dir_all(root.join("home")).unwrap();
+        fs::hard_link(outside.join("Caches/shared.bin"), root.join("linked.bin")).unwrap();
+        symlink(&outside, root.join("home/Library")).unwrap();
+        let bases = home_bases(&root.join("home"));
+        let progress = Progress::default();
+        let walker = walker(&root, &progress);
+        assert!(hotspots(&root, &bases, &walker).is_empty());
+        // Even a previously selected candidate must be revalidated by the prescan.
+        walker.prescan_hotspots(&root, &[(root.join("home/Library/Caches"), 0)]);
+        assert!(walker.prescanned.lock().unwrap().is_empty());
+        assert!(walker.hardlinks.lock().unwrap().is_empty());
+        assert!(progress.early_findings.lock().unwrap().is_empty());
+        let spliced = scan_with_bases(&root, &Progress::default(), &bases);
+        let plain = scan_with_bases(&root, &Progress::default(), &findings::Bases::default());
+        assert_eq!(fingerprint(&spliced), fingerprint(&plain));
+        assert_eq!(spliced.nodes[spliced.find(&root.join("linked.bin")).unwrap()].size, disk_size(&fs::metadata(root.join("linked.bin")).unwrap()));
+    }
+
+    #[test]
+    fn hotspot_root_follow_skip_devices_and_catalog_order() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let real = fixture.0.join("real");
+        write(&real.join("home/.Trash/a"), 4096);
+        write(&real.join("home/Downloads/b"), 8192);
+        write(&real.join("home/Library/Caches/Homebrew/c"), 4096);
+        let root = fixture.0.join("root-link");
+        symlink(&real, &root).unwrap();
+        let bases = home_bases(&root.join("home"));
+        let progress = Progress::default();
+        let mut walker = walker(&root, &progress);
+        // Like the production walker, skip is only consulted below root.
+        walker.skip.insert(root.clone());
+        let selected = hotspots(&root, &bases, &walker);
+        assert_eq!(selected.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>(), vec![root.join("home/.Trash"), root.join("home/Downloads"), root.join("home/Library/Caches")]);
+        assert!(selected.windows(2).all(|pair| pair[0].1 < pair[1].1));
+        walker.skip.insert(root.join("home/Library"));
+        assert_eq!(hotspots(&root, &bases, &walker).len(), 2);
+        walker.skip.insert(root.join("home"));
+        assert!(hotspots(&root, &bases, &walker).is_empty());
+        walker.skip.clear();
+        walker.allowed_devices.clear();
+        assert!(hotspots(&root, &bases, &walker).is_empty());
+    }
+
+    #[test]
+    fn hotspot_unreadable_parent_is_not_prescanned() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("permission fixture requires a non-root user");
+            return;
+        }
+        let fixture = Fixture::new();
+        let root = fixture.0.join("root");
+        let parent = root.join("home/Library");
+        write(&parent.join("Caches/shared.bin"), 32768);
+        fs::hard_link(parent.join("Caches/shared.bin"), root.join("linked.bin")).unwrap();
+        let _restore = RestorePermissions::deny(&parent);
+        let progress = Progress::default();
+        let walker = walker(&root, &progress);
+        let bases = home_bases(&root.join("home"));
+        assert!(hotspots(&root, &bases, &walker).is_empty());
+        let tree = scan_with_bases(&root, &progress, &bases);
+        let plain = scan_with_bases(&root, &Progress::default(), &findings::Bases::default());
+        assert_eq!(fingerprint(&tree), fingerprint(&plain));
+        assert_eq!(tree.unreadable, plain.unreadable);
+        assert!(tree.unreadable.iter().all(|entry| tree.find(&entry.path).is_some()));
+        assert_eq!(tree.nodes[tree.find(&root.join("linked.bin")).unwrap()].size, disk_size(&fs::metadata(root.join("linked.bin")).unwrap()));
+        assert!(progress.early_findings.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hotspot_cancel_before_or_after_main_never_recovers() {
+        for after_main in [false, true] {
+            let fixture = Fixture::new();
+            let root = fixture.0.join("root");
+            write(&root.join("home/Downloads/file"), 8192);
+            let progress = Progress::default();
+            let mut walker = walker(&root, &progress);
+            prescan(&mut walker, &root, &home_bases(&root.join("home")));
+            // Leave the prescan unreachable so even cancellation after a main walk
+            // exercises the leftover branch. No asynchronous sleeps or race timing.
+            fs::rename(root.join("home"), fixture.0.join("moved")).unwrap();
+            if !after_main {
+                progress.cancelled.store(true, Ordering::Relaxed);
+            }
+            let raw = main_walk(&walker, &root);
+            progress.cancelled.store(true, Ordering::Relaxed);
+            let counts = (progress.files.load(Ordering::Relaxed), progress.dirs.load(Ordering::Relaxed));
+            let old_live = progress.live.child("home");
+            assert!(!walker.prescanned.lock().unwrap().is_empty());
+            let recovered = finalize_walk(&mut walker, &root, raw);
+            assert_eq!(recovered.items, 0);
+            assert_eq!(counts, (progress.files.load(Ordering::Relaxed), progress.dirs.load(Ordering::Relaxed)));
+            assert!(Arc::ptr_eq(&old_live, &progress.live.child("home")), "no live reset or fallback on cancel");
+            assert!(walker.prescanned.lock().unwrap().is_empty());
+            assert!(walker.prescanned_paths.is_empty());
+            assert!(progress.early_findings.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn hotspot_cancelled_prescan_does_not_publish_partial_result() {
+        let fixture = Fixture::new();
+        write(&fixture.0.join("Downloads/file"), 8192);
+        let progress = Progress::default();
+        let walker = walker(&fixture.0, &progress);
+        let live = progress.live.child("Downloads");
+        let raw = walker.walk_dir(None, &fixture.0.join("Downloads"), "Downloads".to_string(), 0, &live, 1);
+        // Deterministic cancellation at the publication boundary, before it can
+        // declare either an exact early finding or a completed live node.
+        progress.cancelled.store(true, Ordering::Relaxed);
+        assert!(walker.publish_prescan(&fixture.0.join("Downloads"), 1, raw, &live, 1).is_none());
+        assert!(!live.done.load(Ordering::Acquire));
+        assert!(progress.early_findings.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hotspot_rename_leftovers_recover_counts_links_and_live() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("root");
+        write(&root.join("home/Downloads/shared.bin"), 32768);
+        fs::hard_link(root.join("home/Downloads/shared.bin"), root.join("linked.bin")).unwrap();
+        write(&root.join("other/nested/file"), 4096);
+        let progress = Progress::default();
+        progress.started.set(std::time::Instant::now()).unwrap();
+        progress.outline_done_ms.store(7, Ordering::Relaxed);
+        progress.hotspots_done_ms.store(9, Ordering::Relaxed);
+        let started = *progress.started.get().unwrap();
+        let mut walker = walker(&root, &progress);
+        prescan(&mut walker, &root, &home_bases(&root.join("home")));
+        let old_live = progress.live.child("home");
+        fs::rename(root.join("home"), fixture.0.join("outside")).unwrap();
+        let raw = main_walk(&walker, &root);
+        assert!(!walker.prescanned.lock().unwrap().is_empty());
+        // Stale counters/diagnostics from abandoned passes must not leak into recovery.
+        progress.errors.store(17, Ordering::Relaxed);
+        progress.cloud_only.store(12, Ordering::Relaxed);
+        progress.unreadable.lock().unwrap().push(Unreadable { path: root.join("home"), whole: true, errors: 17 });
+        let raw = finalize_walk(&mut walker, &root, raw);
+        assert_recovery_matches_plain(&walker, &root, raw);
+        assert_eq!(walker.hardlinks.lock().unwrap().len(), 1);
+        assert!(!progress.live.children.lock().unwrap().list.iter().any(|child| Arc::ptr_eq(child, &old_live)));
+        assert_eq!(*progress.started.get().unwrap(), started);
+        assert_eq!(progress.outline_done_ms.load(Ordering::Relaxed), 7);
+        assert_eq!(progress.hotspots_done_ms.load(Ordering::Relaxed), 9);
+    }
+
+    #[test]
+    fn hotspot_parent_becomes_unreadable_recovers_external_link() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let fixture = Fixture::new();
+        let root = fixture.0.join("root");
+        let parent = root.join("home/Library");
+        write(&parent.join("Caches/shared.bin"), 32768);
+        fs::hard_link(parent.join("Caches/shared.bin"), root.join("linked.bin")).unwrap();
+        let progress = Progress::default();
+        let mut walker = walker(&root, &progress);
+        prescan(&mut walker, &root, &home_bases(&root.join("home")));
+        let _restore = RestorePermissions::deny(&parent);
+        let raw = main_walk(&walker, &root);
+        assert!(!walker.prescanned.lock().unwrap().is_empty());
+        let raw = finalize_walk(&mut walker, &root, raw);
+        assert_recovery_matches_plain(&walker, &root, raw);
+        assert_eq!(progress.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(walker.hardlinks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hotspot_becomes_cloud_only_does_not_splice_stale_prescan() {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        write(&root.join("Downloads/file"), 8192);
+        let progress = Progress::default();
+        let mut walker = walker(root, &progress);
+        prescan(&mut walker, root, &home_bases(root));
+        let dir = dirlist::Dir::open(root).unwrap();
+        let mut entry = dir.list(root, false).unwrap().entries.into_iter().find(|entry| entry.name == "Downloads").unwrap();
+        // Inject the listing's cloud flag at the stage boundary, without creating
+        // provider-managed files or downloading any user data.
+        entry.dataless = true;
+        assert!(!walker.admissible_dir(&root.join("Downloads"), &entry));
+        let cloud = walker.walk_subdir(Some(&dir), root, entry, &progress.live, 1).unwrap();
+        assert_eq!(cloud.items, 0);
+        assert_eq!(progress.cloud_only.load(Ordering::Relaxed), 1);
+        assert_eq!(walker.prescanned.lock().unwrap().len(), 1, "cloud metadata takes precedence over cached results");
+        let raw = Raw { name: display_name(root), size: cloud.size, kind: Kind::Dir, items: 0, children: vec![cloud] };
+        let raw = finalize_walk(&mut walker, root, raw);
+        assert_recovery_matches_plain(&walker, root, raw);
+    }
+
+    #[test]
+    fn hotspot_cross_hardlinks_count_exactly_once_without_recovery() {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        write(&root.join("home/Downloads/shared.bin"), 32768);
+        fs::hard_link(root.join("home/Downloads/shared.bin"), root.join("home/linked.bin")).unwrap();
+        fs::create_dir_all(root.join("home/.Trash")).unwrap();
+        fs::hard_link(root.join("home/Downloads/shared.bin"), root.join("home/.Trash/shared.bin")).unwrap();
+        let progress = Progress::default();
+        let tree = scan_with_bases(root, &progress, &home_bases(&root.join("home")));
+        let plain = scan_with_bases(root, &Progress::default(), &findings::Bases::default());
+        assert_eq!(tree.nodes[0].size, plain.nodes[0].size);
+        assert_eq!(tree.nodes[0].items, 3);
+        let sizes: Vec<_> = tree.nodes.iter().filter(|node| node.kind == Kind::File).map(|node| node.size).collect();
+        let expected = disk_size(&fs::metadata(root.join("home/linked.bin")).unwrap());
+        assert_eq!(sizes.iter().sum::<u64>(), expected);
+        assert_eq!(sizes.iter().filter(|&&size| size != 0).count(), 1);
+        let live = crate::live::snapshot(&progress.live, root, None).tree;
+        assert_eq!(live.nodes[0].size, tree.nodes[0].size);
+        assert_eq!(live.nodes[0].items, 3);
+        let early = progress.early_findings.lock().unwrap();
+        assert_eq!(early.len(), 2, "normal splice keeps early findings, no fallback");
+        for finding in early.iter() {
+            assert_eq!(tree.nodes[tree.find(&finding.path).unwrap()].size, finding.size);
+        }
     }
 
     /// The folders FSEvents would report for these changes, as `Stale` entries.

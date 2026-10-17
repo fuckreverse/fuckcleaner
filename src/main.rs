@@ -1,5 +1,8 @@
 mod admin;
+mod agent;
 mod app;
+mod cleanup;
+mod credentials;
 mod classify;
 mod cli;
 mod clock;
@@ -12,8 +15,11 @@ mod json;
 mod live;
 mod motion;
 mod onboarding;
+mod rules;
 mod safety;
 mod scan;
+mod settings;
+mod text_input;
 #[cfg(feature = "snapshot")]
 mod snapshot;
 mod sunburst;
@@ -76,6 +82,7 @@ fn main() {
         cx.on_action(|_: &Minimize, cx| with_window(cx, |window| window.minimize_window()));
         cx.on_action(|_: &Zoom, cx| with_window(cx, |window| window.zoom_window()));
         cx.on_action(|_: &CloseWindow, cx| with_window(cx, |window| window.remove_window()));
+        text_input::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-h", Hide, None),
@@ -84,9 +91,9 @@ fn main() {
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-o", OpenFolder, None),
             KeyBinding::new("cmd-r", Rescan, None),
-            KeyBinding::new("cmd-up", GoUp, None),
-            KeyBinding::new("backspace", GoUp, None),
-            KeyBinding::new("escape", GoUp, None),
+            KeyBinding::new("cmd-up", GoUp, Some("Petal && !TextInput")),
+            KeyBinding::new("backspace", GoUp, Some("Petal && !TextInput")),
+            KeyBinding::new("escape", GoUp, Some("Petal && !TextInput")),
             KeyBinding::new("cmd-shift-d", StartOver, None),
             KeyBinding::new("cmd-1", ShowSunburst, None),
             KeyBinding::new("cmd-2", ShowIcicle, None),

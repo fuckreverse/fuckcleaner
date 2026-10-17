@@ -57,6 +57,18 @@ impl LiveNode {
         child
     }
 
+    /// Start a replacement walk after all workers have joined, preserving the root Arc.
+    /// Detach, rather than recursively mutate, old children: an in-flight snapshot can
+    /// still hold their Arcs and safely finish reading the previous generation.
+    pub(crate) fn reset(&self) {
+        *self.children.lock().unwrap() = LiveChildren::default();
+        self.bytes.store(0, Ordering::Relaxed);
+        self.files.store(0, Ordering::Relaxed);
+        self.done.store(false, Ordering::Release);
+        // Keep root seen/settled OnceLocks. The root is not marked done before scan
+        // finalization, so recovery cannot retain a premature root settlement time.
+    }
+
     pub fn record(&self, bytes: u64, files: u64) {
         if bytes > 0 {
             self.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -64,6 +76,63 @@ impl LiveNode {
         if files > 0 {
             self.files.fetch_add(files, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_detaches_old_generation_and_clears_snapshot_totals() {
+        let root = Arc::new(LiveNode::default());
+        root.record(100, 1);
+        let old = root.child("old");
+        old.record(200, 2);
+        let nested = old.child("nested");
+        nested.record(300, 3);
+        old.done.store(true, Ordering::Release);
+        let before = snapshot(&root, Path::new("/fixture"), None);
+        assert_eq!(before.tree.nodes[0].size, 600);
+        assert_eq!(before.tree.nodes[0].items, 6);
+        assert!(old.seen.get().is_some());
+        assert!(old.settled.get().is_some());
+        assert!(root.settled.get().is_none());
+        let identity = root.clone();
+        root.reset();
+        assert!(Arc::ptr_eq(&identity, &root));
+        let empty = snapshot(&root, Path::new("/fixture"), None);
+        assert_eq!(empty.tree.nodes.len(), 1);
+        assert_eq!(empty.tree.nodes[0].size, 0);
+        assert_eq!(empty.tree.nodes[0].items, 0);
+        assert_eq!(empty.done, vec![false]);
+        assert_eq!(empty.settled, vec![None]);
+        // A snapshot that already cloned the old Arcs can still read them unchanged.
+        assert_eq!(snapshot(&old, Path::new("/old"), None).tree.nodes[0].size, 500);
+        assert_eq!(before.tree.nodes[0].size, 600);
+        let replacement = root.child("old");
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert!(replacement.seen.get().is_none());
+        assert!(replacement.settled.get().is_none());
+        assert!(replacement.children.lock().unwrap().list.is_empty());
+        replacement.record(40, 1);
+        assert!(Arc::ptr_eq(&replacement, &root.child("old")), "index was rebuilt too");
+        let after = snapshot(&root, Path::new("/fixture"), None);
+        assert_eq!(after.tree.nodes[0].size, 40);
+        assert_eq!(after.tree.nodes[0].items, 1);
+    }
+
+    #[test]
+    fn reset_clears_done_and_direct_counts() {
+        let root = LiveNode::default();
+        root.record(90, 4);
+        root.done.store(true, Ordering::Release);
+        root.reset();
+        assert_eq!(root.bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(root.files.load(Ordering::Relaxed), 0);
+        assert!(!root.done.load(Ordering::Acquire));
+        root.record(10, 1);
+        assert_eq!(snapshot(&root, Path::new("/fixture"), None).tree.nodes[0].size, 10);
     }
 }
 

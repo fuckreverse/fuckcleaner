@@ -22,7 +22,7 @@ pub fn has_full_disk_access() -> bool {
 }
 
 /// Where Petal keeps its small bits of state. `PETAL_STATE_DIR` overrides it (for tests).
-fn state_dir() -> Option<PathBuf> {
+pub(crate) fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("PETAL_STATE_DIR") {
         return Some(PathBuf::from(dir));
     }
