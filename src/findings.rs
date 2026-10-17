@@ -4,7 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::i18n::Tr;
 use crate::scan::{Kind, Tree};
+use crate::{t, tf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Safety {
@@ -138,10 +140,99 @@ pub struct Finding {
     pub fix: Fix,
 }
 
+/// The finding title in the UI language. Titles stay English in the structs on
+/// purpose: they're the stable identity (de-dup in `app.rs`, chart labels, CLI
+/// JSON), so display translates them every frame and a language switch applies
+/// on the next one.
+pub fn title_label(title: &'static str) -> &'static str {
+    let key = match title {
+        "Trash" => Tr::FdTitleTrash,
+        "Downloads" => Tr::FdTitleDownloads,
+        "Xcode build files" => Tr::FdTitleXcodeBuild,
+        "Xcode archives" => Tr::FdTitleXcodeArchives,
+        "iOS device support" => Tr::FdTitleDeviceSupport,
+        "iOS simulators" => Tr::FdTitleSimulators,
+        "iPhone & iPad backups" => Tr::FdTitleDeviceBackups,
+        "Docker disk image" => Tr::FdTitleDockerImage,
+        "Ollama models" => Tr::FdTitleOllamaModels,
+        "LM Studio models" => Tr::FdTitleLmStudioModels,
+        "Hugging Face models" => Tr::FdTitleHuggingFaceModels,
+        "App caches" => Tr::FdTitleAppCaches,
+        "Homebrew downloads" => Tr::FdTitleHomebrewDownloads,
+        "npm cache" => Tr::FdTitleNpmCache,
+        "pnpm store" => Tr::FdTitlePnpmStore,
+        "Cargo registry" => Tr::FdTitleCargoRegistry,
+        "Gradle caches" => Tr::FdTitleGradleCaches,
+        "Movies" => Tr::FdTitleMovies,
+        "Chrome update leftovers" => Tr::FdTitleChromeLeftovers,
+        "Mail" => Tr::FdTitleMail,
+        "Claude Code history" => Tr::FdTitleClaudeHistory,
+        "Codex history" => Tr::FdTitleCodexHistory,
+        "node_modules" => Tr::FdTitleNodeModules,
+        "Cargo build files" => Tr::FdTitleCargoBuild,
+        "Unpacked Git data" => Tr::FdTitleGitData,
+        other => return other,
+    };
+    t!(key)
+}
+
+/// The `Tr` key whose English template is this catalog blurb (the English
+/// string doubles as the stable ID). Blurbs built at runtime, with counts
+/// already filled in, have no key — `Finding::blurb_label` rebuilds those.
+fn static_blurb_key(blurb: &str) -> Option<Tr> {
+    Some(match blurb {
+        "Emptying the Trash frees this space" => Tr::FdBlurbTrash,
+        "Old installers and archives tend to pile up here" => Tr::FdBlurbDownloads,
+        "Xcode rebuilds these when you next build" => Tr::FdBlurbXcodeBuild,
+        "Keep the ones you need to symbolicate crash logs" => Tr::FdBlurbXcodeArchives,
+        "Re-downloaded when a device next connects" => Tr::FdBlurbDeviceSupport,
+        "Remove old ones with `xcrun simctl delete unavailable`" => Tr::FdBlurbSimulators,
+        "Old device backups; manage them in Finder" => Tr::FdBlurbDeviceBackups,
+        "Images, containers and volumes; `docker system prune` or Docker's settings shrink it" => Tr::FdBlurbDockerImage,
+        "Downloaded models you'd download again; remove one with `ollama rm <model>`" => Tr::FdBlurbOllamaModels,
+        "Downloaded models you'd download again; remove them in LM Studio" => Tr::FdBlurbLmStudioModels,
+        "Downloaded models you'd download again; `hf cache` commands remove chosen ones" => Tr::FdBlurbHuggingFaceModels,
+        "Apps rebuild their caches as needed" => Tr::FdBlurbAppCaches,
+        "Fetched again when needed; `brew cleanup --prune=all` clears them" => Tr::FdBlurbHomebrewDownloads,
+        "Re-downloaded on the next install" => Tr::FdBlurbNpmCache,
+        "Counts only files no project links to; `pnpm store prune` removes unused packages" => Tr::FdBlurbPnpmStore,
+        "Re-downloaded on the next build" => Tr::FdBlurbNextBuild,
+        "Videos and editing projects" => Tr::FdBlurbMovies,
+        "Old copies Chrome keeps while updating; quit Chrome first" => Tr::FdBlurbChromeLeftovers,
+        "Messages and downloaded attachments" => Tr::FdBlurbMail,
+        "Your conversations, kept so you can resume them; Claude Code clears old ones itself" => Tr::FdBlurbClaudeHistory,
+        "Your Codex conversations, kept so you can resume them" => Tr::FdBlurbCodexHistory,
+        _ => return None,
+    })
+}
+
 impl Finding {
     /// Whether its folders can go in the Collector (and from there to the Trash).
     pub fn collectable(&self) -> bool {
         self.fix == Fix::Trash && self.safety != Safety::ManageInApp
+    }
+
+    /// The title in the UI language.
+    pub fn title_label(&self) -> &'static str {
+        title_label(self.title)
+    }
+
+    /// The blurb in the UI language. The struct keeps the English string (for
+    /// the three findings built at runtime, the English text with counts
+    /// already in); those three are rebuilt here from their templates so every
+    /// language reads naturally.
+    pub fn blurb_label(&self) -> String {
+        match self.title {
+            "node_modules" => tf!(Tr::FdBlurbModules, "n" => self.nodes.len()),
+            "Cargo build files" if self.nodes.len() == 1 => t!(Tr::FdBlurbCargoOne).into(),
+            "Cargo build files" => tf!(Tr::FdBlurbCargoMany, "n" => self.nodes.len()),
+            "Unpacked Git data" if self.nodes.len() == 1 => t!(Tr::FdBlurbGitOne).into(),
+            "Unpacked Git data" => tf!(Tr::FdBlurbGitMany, "n" => self.nodes.len()),
+            _ => match static_blurb_key(&self.blurb) {
+                Some(key) => t!(key).to_string(),
+                None => self.blurb.clone(),
+            },
+        }
     }
 }
 

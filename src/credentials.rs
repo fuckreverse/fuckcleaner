@@ -1,15 +1,18 @@
 //! API credentials are kept exclusively in the macOS login Keychain.
 
+use crate::i18n::Tr;
+use crate::{t, tf};
+
 const SERVICE: &str = "com.petal.ai";
 // Versioned accounts never fall back to the legacy provider-api-key entry.
 fn account_for(origin: &str) -> Result<String, String> {
     let (url, protocol) = origin
         .rsplit_once('|')
-        .ok_or_else(|| "凭据 scope 必须由 AgentConfig::credential_scope 生成".to_string())?;
+        .ok_or_else(|| t!(Tr::CrScopeInvalid).to_string())?;
     if !matches!(protocol, "chat_completions" | "responses" | "anthropic") {
-        return Err("凭据协议 scope 无效".into());
+        return Err(t!(Tr::CrScopeProtocolInvalid).into());
     }
-    let parsed = reqwest::Url::parse(url).map_err(|_| "凭据 origin 无效".to_string())?;
+    let parsed = reqwest::Url::parse(url).map_err(|_| t!(Tr::CrOriginInvalid).to_string())?;
     if parsed.scheme() != "https"
         || parsed.host_str().is_none()
         || matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
@@ -21,7 +24,7 @@ fn account_for(origin: &str) -> Result<String, String> {
         || parsed.origin().ascii_serialization() != url
         || origin.len() > 512
     {
-        return Err("凭据 scope 必须是规范化的 HTTPS origin 与协议".into());
+        return Err(t!(Tr::CrScopeNotHttps).into());
     }
     Ok(format!("v2|{origin}"))
 }
@@ -34,16 +37,16 @@ pub fn load_key_for(origin: &str) -> Result<Option<String>, String> {
         match security_framework::passwords::get_generic_password(SERVICE, &account) {
             Ok(bytes) => {
                 let key = String::from_utf8(bytes)
-                    .map_err(|_| "Keychain 中的 API key 编码无效".to_string())?;
+                    .map_err(|_| t!(Tr::CrKeyEncodedInvalid).to_string())?;
                 validate_key(&key)?;
                 Ok(Some(key))
             }
             Err(error) if error.code() == -25300 => Ok(None),
-            Err(error) => Err(format!("无法读取 Keychain（错误码 {}）", error.code())),
+            Err(error) => Err(tf!(Tr::CrReadFailed, "code" => error.code())),
         }
     }
     #[cfg(not(target_os = "macos"))]
-    Err("API key 存储仅支持 macOS Keychain".into())
+    Err("API key storage only supports the macOS Keychain".into())
 }
 
 pub fn save_key_for(origin: &str, key: &str) -> Result<(), String> {
@@ -52,10 +55,10 @@ pub fn save_key_for(origin: &str, key: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         security_framework::passwords::set_generic_password(SERVICE, &account, key.as_bytes())
-            .map_err(|error| format!("无法保存 Keychain（错误码 {}）", error.code()))
+            .map_err(|error| tf!(Tr::CrSaveFailed, "code" => error.code()))
     }
     #[cfg(not(target_os = "macos"))]
-    Err("API key 存储仅支持 macOS Keychain".into())
+    Err("API key storage only supports the macOS Keychain".into())
 }
 
 pub fn delete_key_for(origin: &str) -> Result<(), String> {
@@ -65,17 +68,17 @@ pub fn delete_key_for(origin: &str) -> Result<(), String> {
         match security_framework::passwords::delete_generic_password(SERVICE, &account) {
             Ok(()) => Ok(()),
             Err(error) if error.code() == -25300 => Ok(()),
-            Err(error) => Err(format!("无法删除 Keychain（错误码 {}）", error.code())),
+            Err(error) => Err(tf!(Tr::CrDeleteFailed, "code" => error.code())),
         }
     }
     #[cfg(not(target_os = "macos"))]
-    Err("API key 存储仅支持 macOS Keychain".into())
+    Err("API key storage only supports the macOS Keychain".into())
 }
 
 fn validate_key(key: &str) -> Result<(), String> {
     if key.is_empty() || key.len() > MAX_KEY_BYTES || !key.bytes().all(|b| (33..=126).contains(&b))
     {
-        return Err("API key 必须是非空、无空白的 ASCII 字符串，且不超过 4096 字节".into());
+        return Err(t!(Tr::CrKeyFormatInvalid).into());
     }
     Ok(())
 }

@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 
 use crate::findings::{Finding, Fix, Safety};
+use crate::i18n::Tr;
+use crate::t;
 use crate::scan::Tree;
 
 pub const SAFE: u32 = 0x3fb950;
@@ -28,11 +30,13 @@ pub fn color(safety: Option<Safety>) -> u32 {
 }
 
 /// How the findings list and the chart's legend name a verdict.
+/// How the findings list and the chart's legend name a verdict. Localized at
+/// call time; the strings come from the i18n table.
 pub fn label(safety: Safety) -> &'static str {
     match safety {
-        Safety::Safe => "Safe to delete",
-        Safety::Review => "Review first",
-        Safety::ManageInApp => "Manage in app",
+        Safety::Safe => t!(Tr::SafetySafe),
+        Safety::Review => t!(Tr::SafetyReview),
+        Safety::ManageInApp => t!(Tr::SafetyManage),
     }
 }
 

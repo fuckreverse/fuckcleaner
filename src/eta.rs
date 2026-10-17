@@ -50,12 +50,14 @@ pub fn fraction(items: u64, total: u64) -> f32 {
     (items as f64 / total.max(1) as f64).min(0.99) as f32
 }
 
+/// Human words for the estimated seconds left, localized.
 pub fn describe(remaining: f64) -> String {
+    use crate::i18n::Tr;
     if remaining < 2.0 {
-        "finishing up…".to_string()
+        crate::t!(Tr::EtaFinishing).to_string()
     } else if remaining < 60.0 {
-        format!("about {} s left", (remaining / 5.0).ceil() as u64 * 5)
+        crate::tf!(Tr::EtaSecondsLeft, "n" => (remaining / 5.0).ceil() as u64 * 5)
     } else {
-        format!("about {} min left", (remaining / 60.0).ceil() as u64)
+        crate::tf!(Tr::EtaMinutesLeft, "n" => (remaining / 60.0).ceil() as u64)
     }
 }

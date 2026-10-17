@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::findings::{Finding, Fix, Safety};
+use crate::i18n::Tr;
 use crate::rules::{CleanupAction, CleanupCategory, Rule, RuleSource};
 use crate::scan::{Kind, Tree};
 use crate::settings::Settings;
+use crate::{t, tf};
 
 const MAX_ENTRIES: usize = 200;
 const MAX_RULES: usize = 20;
@@ -79,7 +81,7 @@ impl AgentConfig {
     pub fn credential_scope(&self) -> Result<String, String> {
         let url = endpoint_url(self)?;
         if url.scheme() != "https" || is_loopback_url(&url) {
-            return Err("本地服务不使用远程 Keychain 凭据".into());
+            return Err(t!(Tr::AgLocalNoRemoteKeychain).into());
         }
         let protocol = match self.protocol {
             AgentProtocol::ChatCompletions => "chat_completions",
@@ -95,7 +97,7 @@ impl AgentConfig {
             || self.model.len() > 200
             || self.model.chars().any(char::is_control)
         {
-            return Err("模型名称不能为空、包含控制字符或超过 200 字节".into());
+            return Err(t!(Tr::AgModelInvalid).into());
         }
         Ok(())
     }
@@ -355,7 +357,7 @@ struct ScanIndex {
 
 fn cancelled(cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
-        Err("AI 摘要已取消".into())
+        Err(t!(Tr::AgSummaryCancelled).into())
     } else {
         Ok(())
     }
@@ -382,7 +384,7 @@ fn node_chain(tree: &Tree, ix: usize) -> Option<Vec<usize>> {
 impl ScanIndex {
     fn empty(tree: &Tree) -> Result<Self, String> {
         if tree.nodes.is_empty() {
-            return Err("当前没有可用的扫描结果".into());
+            return Err(t!(Tr::AgNoScanResults).into());
         }
         let mut index = Self {
             paths: HashMap::new(),
@@ -541,7 +543,7 @@ fn request_index(
             || !index.add_chain(tree, ix)
             || index.locations.get(&ix) != Some(&logical_path(path))
         {
-            return Err("选中节点提示无效、未附着、超过深度限制或与请求路径不一致".into());
+            return Err(t!(Tr::AgSelectionInvalid).into());
         }
         Some(ix)
     } else if let AgentRequest::Explain { path } = request {
@@ -1073,7 +1075,7 @@ pub fn context_from_tree_cancellable(
             "rule_fields_redacted": true, "finding_text_redacted": true, "overlapping_sizes": true, "no_file_contents": true}});
     // Bound the serialized output too; larger shared paths return a smaller summary.
     while serde_json::to_vec(&wire)
-        .map_err(|_| "无法编码扫描摘要".to_string())?
+        .map_err(|_| t!(Tr::AgEncodeSummary).to_string())?
         .len()
         > MAX_CONTEXT_BYTES
     {
@@ -1102,7 +1104,7 @@ pub fn context_from_tree_cancellable(
         wire["limits"]["serialized_output_truncated"] = json!(true);
         wire["coverage"]["output_partial"] = json!(true);
         if !removed {
-            return Err("无法编码有限扫描摘要".into());
+            return Err(t!(Tr::AgEncodeBoundedSummary).into());
         }
     }
     let entries_kept = wire["entries"].as_array().unwrap().len();
@@ -1197,9 +1199,9 @@ fn endpoint_url(config: &AgentConfig) -> Result<Url, String> {
         || base.contains('\\')
         || base.chars().any(char::is_control)
     {
-        return Err("AI 服务地址无效".into());
+        return Err(t!(Tr::AgEndpointInvalid).into());
     }
-    let mut url = Url::parse(base).map_err(|_| "AI 服务地址必须是有效的 HTTPS URL".to_string())?;
+    let mut url = Url::parse(base).map_err(|_| t!(Tr::AgEndpointNotHttpsUrl).to_string())?;
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -1207,16 +1209,14 @@ fn endpoint_url(config: &AgentConfig) -> Result<Url, String> {
         || url.host_str().is_none()
         || !(url.scheme() == "https" || (url.scheme() == "http" && raw_loopback(base)))
     {
-        return Err(
-            "服务地址仅允许 HTTPS 或 HTTP localhost/127.0.0.1/[::1]，不得含凭据、查询或片段".into(),
-        );
+        return Err(t!(Tr::AgEndpointScheme).into());
     }
     let path = url.path().trim_end_matches('/');
     let all_endpoints = ["/chat/completions", "/responses", "/messages"];
     let normalized = if path.ends_with(config.protocol.endpoint()) {
         path.to_string()
     } else if all_endpoints.iter().any(|suffix| path.ends_with(suffix)) {
-        return Err("服务 endpoint 与所选协议不一致".into());
+        return Err(t!(Tr::AgEndpointProtocolMismatch).into());
     } else if path.is_empty() {
         format!("/v1{}", config.protocol.endpoint())
     } else {
@@ -1235,7 +1235,7 @@ fn request_headers(protocol: AgentProtocol, key: Option<&str>) -> Result<HeaderM
     }
     if let Some(key) = key {
         if key.is_empty() || key.len() > 4096 || !key.bytes().all(|b| (33..=126).contains(&b)) {
-            return Err("API key 格式无效".into());
+            return Err(t!(Tr::AgKeyInvalid).into());
         }
         let (name, value) = if protocol == AgentProtocol::Anthropic {
             (
@@ -1246,7 +1246,7 @@ fn request_headers(protocol: AgentProtocol, key: Option<&str>) -> Result<HeaderM
             (AUTHORIZATION, format!("Bearer {key}"))
         };
         let mut value =
-            HeaderValue::from_str(&value).map_err(|_| "API key 格式无效".to_string())?;
+            HeaderValue::from_str(&value).map_err(|_| t!(Tr::AgKeyInvalid).to_string())?;
         value.set_sensitive(true);
         headers.insert(name, value);
     }
@@ -1254,9 +1254,9 @@ fn request_headers(protocol: AgentProtocol, key: Option<&str>) -> Result<HeaderM
 }
 
 fn request_body(config: &AgentConfig, wire: &Value) -> Result<Value, String> {
-    let content = serde_json::to_string(wire).map_err(|_| "无法编码 AI 上下文".to_string())?;
+    let content = serde_json::to_string(wire).map_err(|_| t!(Tr::AgEncodeContext).to_string())?;
     if content.len() > MAX_CONTEXT_BYTES {
-        return Err("AI 上下文过大".into());
+        return Err(t!(Tr::AgContextTooLarge).into());
     }
     Ok(match config.protocol {
         AgentProtocol::ChatCompletions => {
@@ -1297,9 +1297,9 @@ fn response_text(protocol: AgentProtocol, value: &Value) -> Result<String, Strin
         AgentProtocol::ChatCompletions => {
             let choice = value
                 .pointer("/choices/0")
-                .ok_or_else(|| "服务未返回文本结果".to_string())?;
+                .ok_or_else(|| t!(Tr::AgNoTextResult).to_string())?;
             if choice.get("finish_reason").and_then(Value::as_str) != Some("stop") {
-                return Err("服务结果未完整结束或请求了工具，已拒绝".into());
+                return Err(t!(Tr::AgNotFullyFinished).into());
             }
             let message = &choice["message"];
             if message
@@ -1307,7 +1307,7 @@ fn response_text(protocol: AgentProtocol, value: &Value) -> Result<String, Strin
                 .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()))
                 || message.get("function_call").is_some_and(|v| !v.is_null())
             {
-                return Err("不允许 AI 工具调用".into());
+                return Err(t!(Tr::AgToolCallsForbidden).into());
             }
             if let Some(text) = message["content"].as_str() {
                 parts.push(text);
@@ -1315,11 +1315,11 @@ fn response_text(protocol: AgentProtocol, value: &Value) -> Result<String, Strin
         }
         AgentProtocol::Responses => {
             if value["status"].as_str() != Some("completed") {
-                return Err("Responses 结果未完整结束".into());
+                return Err(t!(Tr::AgResponsesUnfinished).into());
             }
             let output = value["output"]
                 .as_array()
-                .ok_or_else(|| "Responses 输出格式无效".to_string())?;
+                .ok_or_else(|| t!(Tr::AgResponsesInvalidOutput).to_string())?;
             for item in output {
                 match item["type"].as_str() {
                     Some("message") => {
@@ -1334,17 +1334,17 @@ fn response_text(protocol: AgentProtocol, value: &Value) -> Result<String, Strin
                         }
                     }
                     Some("reasoning") => {}
-                    _ => return Err("Responses 包含非文本或工具输出，已拒绝".into()),
+                    _ => return Err(t!(Tr::AgResponsesNonText).into()),
                 }
             }
         }
         AgentProtocol::Anthropic => {
             if value["stop_reason"].as_str() != Some("end_turn") {
-                return Err("Anthropic 结果未完整结束或请求了工具，已拒绝".into());
+                return Err(t!(Tr::AgAnthropicUnfinished).into());
             }
             let content = value["content"]
                 .as_array()
-                .ok_or_else(|| "Anthropic 输出格式无效".to_string())?;
+                .ok_or_else(|| t!(Tr::AgAnthropicInvalidOutput).to_string())?;
             for block in content {
                 match block["type"].as_str() {
                     Some("text") => {
@@ -1353,14 +1353,14 @@ fn response_text(protocol: AgentProtocol, value: &Value) -> Result<String, Strin
                         }
                     }
                     Some("thinking") | Some("redacted_thinking") => {}
-                    _ => return Err("Anthropic 包含非文本或工具输出，已拒绝".into()),
+                    _ => return Err(t!(Tr::AgAnthropicNonText).into()),
                 }
             }
         }
     }
     let text = parts.join("\n");
     if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES {
-        return Err("AI 文本为空或超过 64 KiB 限制".into());
+        return Err(t!(Tr::AgTextEmptyOrTooLarge).into());
     }
     Ok(text)
 }
@@ -1371,17 +1371,17 @@ pub fn run(
     request: AgentRequest,
 ) -> Result<AgentResponse, String> {
     if !config.enabled {
-        return Err("AI 网络访问默认关闭，请先在设置中明确启用".into());
+        return Err(t!(Tr::AgNetworkDisabled).into());
     }
     config.validate()?;
     if context.request_kind != request_kind(&request)
         || context.share_paths != config.share_paths
         || matches!(&request, AgentRequest::Explain { path } if context.selected_path.as_ref() != Some(&logical_path(path)))
     {
-        return Err("AI 请求与扫描上下文不匹配，请重新生成摘要".into());
+        return Err(t!(Tr::AgContextMismatch).into());
     }
     if context.wire != context.sealed_wire {
-        return Err("扫描上下文被修改，请重新生成摘要".into());
+        return Err(t!(Tr::AgContextModified).into());
     }
     let url = endpoint_url(config)?;
     // Local services never receive the remote provider's credential. They may be
@@ -1392,7 +1392,7 @@ pub fn run(
         crate::credentials::load_key_for(&config.credential_scope()?)?
     };
     if key.is_none() && !is_loopback_url(&url) {
-        return Err("远程 AI 服务需要先将 API key 保存到 Keychain".into());
+        return Err(t!(Tr::AgRemoteNeedsKeychain).into());
     }
     let headers = request_headers(config.protocol, key.as_deref())?;
     let body = request_body(config, &context.sealed_wire)?;
@@ -1405,13 +1405,13 @@ pub fn run(
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(45))
         .build()
-        .map_err(|error| transport_error("创建连接", &error))?;
+        .map_err(|error| transport_error(t!(Tr::AgStageConnect), &error))?;
     let mut response = client
         .post(url)
         .headers(headers)
         .json(&body)
         .send()
-        .map_err(|error| transport_error("发送请求", &error))?;
+        .map_err(|error| transport_error(t!(Tr::AgStageSend), &error))?;
     if !response.status().is_success() {
         return Err(http_status_error(response.status().as_u16()));
     }
@@ -1419,26 +1419,26 @@ pub fn run(
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES)
     {
-        return Err("AI 响应超过 2 MiB 限制".into());
+        return Err(t!(Tr::AgResponseTooLarge).into());
     }
     let mut bytes = Vec::new();
     (&mut response)
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| match error.kind() {
-            std::io::ErrorKind::TimedOut => "AI 响应读取超时（请求限 45 秒）".to_string(),
-            std::io::ErrorKind::UnexpectedEof => "AI 响应被提前截断，请检查服务状态".to_string(),
-            _ => "AI 响应传输中断，请检查网络或服务状态".to_string(),
+            std::io::ErrorKind::TimedOut => t!(Tr::AgReadTimeout).to_string(),
+            std::io::ErrorKind::UnexpectedEof => t!(Tr::AgReadTruncated).to_string(),
+            _ => t!(Tr::AgReadInterrupted).to_string(),
         })?;
     if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err("AI 响应超过 2 MiB 限制".into());
+        return Err(t!(Tr::AgResponseTooLarge).into());
     }
     let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "AI 服务返回了无效 JSON".to_string())?;
+        serde_json::from_slice(&bytes).map_err(|_| t!(Tr::AgInvalidJson).to_string())?;
     let text = response_text(config.protocol, &value)?;
     // Never expose the exact credential, even if a misbehaving provider echoes it.
     if key.as_ref().is_some_and(|key| text.contains(key)) {
-        return Err("服务响应包含敏感凭据，已拒绝显示".into());
+        return Err(t!(Tr::AgCredentialEcho).into());
     }
     let result = match request {
         AgentRequest::GenerateRules => parse_proposals(&text, &context)?,
@@ -1457,7 +1457,7 @@ pub fn run(
                     || rule.exclude.iter().any(|s| s.contains(key))
             })
         {
-            return Err("服务响应包含敏感凭据，已拒绝显示".into());
+            return Err(t!(Tr::AgCredentialEcho).into());
         }
     }
     Ok(result)
@@ -1476,7 +1476,7 @@ pub fn test_connection(config: &AgentConfig) -> Result<String, String> {
         crate::credentials::load_key_for(&config.credential_scope()?)?
     };
     if key.is_none() && !loopback {
-        return Err("远程 AI 服务需要先将 API key 保存到 Keychain".into());
+        return Err(t!(Tr::AgRemoteNeedsKeychain).into());
     }
     let headers = request_headers(config.protocol, key.as_deref())?;
     // 探测上下文是固定常量：无路径、无扫描元数据。
@@ -1490,13 +1490,13 @@ pub fn test_connection(config: &AgentConfig) -> Result<String, String> {
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(45))
         .build()
-        .map_err(|error| transport_error("创建连接", &error))?;
+        .map_err(|error| transport_error(t!(Tr::AgStageConnect), &error))?;
     let mut response = client
         .post(url)
         .headers(headers)
         .json(&body)
         .send()
-        .map_err(|error| transport_error("发送请求", &error))?;
+        .map_err(|error| transport_error(t!(Tr::AgStageSend), &error))?;
     if !response.status().is_success() {
         return Err(http_status_error(response.status().as_u16()));
     }
@@ -1504,21 +1504,21 @@ pub fn test_connection(config: &AgentConfig) -> Result<String, String> {
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES)
     {
-        return Err("AI 响应超过 2 MiB 限制".into());
+        return Err(t!(Tr::AgResponseTooLarge).into());
     }
     let mut bytes = Vec::new();
     (&mut response)
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| match error.kind() {
-            std::io::ErrorKind::TimedOut => "AI 响应读取超时（请求限 45 秒）".to_string(),
-            _ => "AI 响应传输中断，请检查网络或服务状态".to_string(),
+            std::io::ErrorKind::TimedOut => t!(Tr::AgReadTimeout).to_string(),
+            _ => t!(Tr::AgReadInterrupted).to_string(),
         })?;
     if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err("AI 响应超过 2 MiB 限制".into());
+        return Err(t!(Tr::AgResponseTooLarge).into());
     }
     let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "AI 服务返回了无效 JSON".to_string())?;
+        serde_json::from_slice(&bytes).map_err(|_| t!(Tr::AgInvalidJson).to_string())?;
     let reachable = match config.protocol {
         AgentProtocol::ChatCompletions => {
             value["choices"].as_array().is_some_and(|c| !c.is_empty())
@@ -1530,46 +1530,47 @@ pub fn test_connection(config: &AgentConfig) -> Result<String, String> {
         AgentProtocol::Anthropic => value["content"].as_array().is_some(),
     };
     if !reachable {
-        return Err("服务返回 HTTP 200 但缺少预期的结果结构，请确认 endpoint 与协议匹配".into());
+        return Err(t!(Tr::AgProbeUnreachable).into());
     }
     let elapsed = started.elapsed().as_secs_f32();
-    Ok(format!(
-        "AI 连接测试成功：{}（模型 {}），耗时 {elapsed:.1}s；地址、密钥与响应结构均可用。",
-        config.protocol.label(),
-        config.model
+    Ok(tf!(
+        Tr::AgProbeOk,
+        "protocol" => config.protocol.label(),
+        "model" => config.model,
+        "elapsed" => format!("{elapsed:.1}")
     ))
 }
 
 fn transport_error(stage: &str, error: &reqwest::Error) -> String {
     let reason = if error.is_timeout() {
-        "超时：连接限 5 秒、请求限 45 秒"
+        t!(Tr::AgTransportTimeout)
     } else if error.is_connect() {
-        "连接失败：请检查 DNS、服务端口、TLS 证书和网络；不使用环境代理"
+        t!(Tr::AgTransportConnect)
     } else if error.is_builder() {
-        "请求构建失败：请检查地址及认证头格式"
+        t!(Tr::AgTransportBuilder)
     } else if error.is_body() || error.is_decode() {
-        "响应传输或解码失败"
+        t!(Tr::AgTransportBody)
     } else {
-        "传输失败：请检查服务及网络"
+        t!(Tr::AgTransportOther)
     };
     // Never format Error/URL/source: they can contain keys and provider payloads.
-    format!("AI {stage}失败：{reason}")
+    tf!(Tr::AgTransportFail, "stage" => stage, "reason" => reason)
 }
 
 fn http_status_error(status: u16) -> String {
     let hint = match status {
-        300..=399 => "服务重定向被禁止，请直接配置最终 HTTPS endpoint",
-        400 | 422 => "请求参数不兼容，请检查协议、模型名称与 endpoint",
-        401 => "认证失败，请为当前服务和协议重新保存 API key",
-        403 => "服务拒绝访问，请检查 key 权限与模型授权",
-        404 => "endpoint 或模型不存在，请检查协议和 base URL",
-        408 | 504 => "服务端超时，请稍后重试",
-        413 => "服务认为上下文过大，请缩小扫描范围",
-        429 => "服务限流或额度不足，请检查配额后重试",
-        500..=599 => "服务端异常，请稍后重试或检查服务运行状态",
-        _ => "请检查服务配置；为保护凭据未显示服务原始响应",
+        300..=399 => t!(Tr::AgHttpRedirect),
+        400 | 422 => t!(Tr::AgHttpParams),
+        401 => t!(Tr::AgHttp401),
+        403 => t!(Tr::AgHttp403),
+        404 => t!(Tr::AgHttp404),
+        408 | 504 => t!(Tr::AgHttpTimeout),
+        413 => t!(Tr::AgHttpTooLarge),
+        429 => t!(Tr::AgHttpRateLimited),
+        500..=599 => t!(Tr::AgHttpServerError),
+        _ => t!(Tr::AgHttpOther),
     };
-    format!("AI 请求失败（HTTP {status}）：{hint}")
+    tf!(Tr::AgHttpStatusFail, "status" => status, "hint" => hint)
 }
 
 // Deserialize raw maps before Value can overwrite duplicate keys. Consume a full
@@ -1690,27 +1691,27 @@ fn json_without_fence(text: &str) -> Result<&str, String> {
     let text = text.trim();
     if text.starts_with("```") {
         let Some((opening, rest)) = text.split_once('\n') else {
-            return Err("规则 JSON 围栏无效".into());
+            return Err(t!(Tr::AgFenceInvalid).into());
         };
         if opening != "```json" && opening != "```" {
-            return Err("仅允许 JSON 围栏".into());
+            return Err(t!(Tr::AgFenceOnlyJson).into());
         }
         return rest
             .strip_suffix("```")
             .map(str::trim)
-            .ok_or_else(|| "规则 JSON 围栏未闭合".into());
+            .ok_or_else(|| t!(Tr::AgFenceUnclosed).into());
     }
     Ok(text)
 }
 
 fn parse_proposals(text: &str, context: &AgentContext) -> Result<AgentResponse, String> {
     if text.len() > MAX_TEXT_BYTES {
-        return Err("规则 JSON 超过 64 KiB 限制".into());
+        return Err(t!(Tr::AgDraftTooLarge).into());
     }
     let envelope: DraftEnvelope = serde_json::from_str(json_without_fence(text)?)
-        .map_err(|_| "规则草案必须是严格 JSON 对象，且不能有额外字段".to_string())?;
+        .map_err(|_| t!(Tr::AgDraftEnvelopeInvalid).to_string())?;
     if envelope.explanation.len() > MAX_TEXT_BYTES || envelope.rules.len() > MAX_RULES {
-        return Err("规则草案超过文本或 20 条规则限制".into());
+        return Err(t!(Tr::AgDraftLimit).into());
     }
     let mut explanation = envelope.explanation;
     let mut proposals = Vec::new();
@@ -1718,27 +1719,26 @@ fn parse_proposals(text: &str, context: &AgentContext) -> Result<AgentResponse, 
         // Option fields in serde normally accept absence; this schema requires an
         // explicit older_than_days (null is allowed) just like every other field.
         let validated = if value.duplicate {
-            Err("规则包含重复 JSON 字段".to_string())
+            Err(t!(Tr::AgDraftDuplicateField).to_string())
         } else if value.value.get("older_than_days").is_none() {
-            Err("字段缺失、类型错误或含禁止字段".to_string())
+            Err(t!(Tr::AgDraftFieldInvalid).to_string())
         } else {
             serde_json::from_value::<DraftRule>(value.value)
-                .map_err(|_| "字段缺失、类型错误或含禁止字段".to_string())
+                .map_err(|_| t!(Tr::AgDraftFieldInvalid).to_string())
         }
         .and_then(|draft| validate_draft(draft, context));
         match validated {
             Ok(rule) => proposals.push(rule),
             // No raw provider strings or Rule::validate error text in diagnostics.
             Err(error) => {
-                explanation.push_str(&format!("\n第 {} 条草案已拒绝：{}。", i + 1, error))
+                explanation.push_str(&tf!(Tr::AgDraftRejected, "n" => i + 1, "e" => error))
             }
         }
     }
     if proposals.is_empty() {
-        explanation.push_str("\n没有可供审核的有效规则草案；未创建或启用任何规则。");
+        explanation.push_str(t!(Tr::AgDraftNoneValid));
     } else {
-        explanation
-            .push_str("\n以上规则仅为禁用状态的草案，必须逐条审核并明确启用；不会自动清理。");
+        explanation.push_str(t!(Tr::AgDraftDisclaimer));
     }
     Ok(AgentResponse {
         explanation,
@@ -1760,7 +1760,7 @@ fn validate_draft(draft: DraftRule, context: &AgentContext) -> Result<Rule, Stri
         || draft.older_than_days.is_some_and(|days| days > 36500)
         || !(-1000..=1000).contains(&draft.priority)
     {
-        return Err("字段长度、数量或数值超限".into());
+        return Err(t!(Tr::AgDraftOutOfBounds).into());
     }
     if [&draft.name, &draft.description, &draft.pattern]
         .iter()
@@ -1770,11 +1770,11 @@ fn validate_draft(draft: DraftRule, context: &AgentContext) -> Result<Rule, Stri
             .iter()
             .any(|s| s.chars().any(char::is_control))
     {
-        return Err("字段包含控制字符".into());
+        return Err(t!(Tr::AgDraftControlChars).into());
     }
     // Glob patterns are relative to a concrete candidate root, never arbitrary paths.
     if !safe_pattern(&draft.pattern) || draft.exclude.iter().any(|s| !relative_pattern(s)) {
-        return Err("匹配表达式含越界路径或敏感目标".into());
+        return Err(t!(Tr::AgDraftUnsafePattern).into());
     }
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
@@ -1783,7 +1783,7 @@ fn validate_draft(draft: DraftRule, context: &AgentContext) -> Result<Rule, Stri
             .roots
             .get(&id)
             .filter(|p| safe_root(p))
-            .ok_or_else(|| "引用了上下文外或不安全的根目录".to_string())?;
+            .ok_or_else(|| t!(Tr::AgDraftUnsafeRoot).to_string())?;
         if seen.insert(id) {
             roots.push(path.clone());
         }
@@ -1838,7 +1838,7 @@ fn validate_draft(draft: DraftRule, context: &AgentContext) -> Result<Rule, Stri
         source: RuleSource::Ai,
     };
     rule.validate()
-        .map_err(|_| "未通过本地规则安全验证".to_string())?;
+        .map_err(|_| t!(Tr::AgDraftValidationFailed).to_string())?;
     Ok(rule)
 }
 
@@ -2129,7 +2129,7 @@ mod tests {
         let empty =
             parse_proposals("{\"explanation\":\"unknown\",\"rules\":[]}", &context()).unwrap();
         assert!(empty.proposals.is_empty());
-        assert!(empty.explanation.contains("没有可供审核"));
+        assert!(empty.explanation.contains("No usable rule drafts"));
     }
 
     fn test_home() -> PathBuf {
@@ -2324,12 +2324,12 @@ mod tests {
         assert!(
             run(&enabled, summary, AgentRequest::GenerateRules)
                 .unwrap_err_string()
-                .contains("被修改")
+                .contains("modified")
         );
         assert!(
             run(&enabled, context(), AgentRequest::Analyze)
                 .unwrap_err_string()
-                .contains("不匹配")
+                .contains("does not match")
         );
     }
 
@@ -2491,7 +2491,7 @@ mod tests {
             let envelope = format!(r#"{{"explanation":"review","rules":[{invalid},{valid}]}}"#);
             let result = parse_proposals(&envelope, &context()).unwrap();
             assert_eq!(result.proposals.len(), 1);
-            assert!(result.explanation.contains("第 1 条草案已拒绝"));
+            assert!(result.explanation.contains("Draft 1 rejected"));
         }
         let mut missing = draft();
         missing.as_object_mut().unwrap().remove("older_than_days");
@@ -2951,11 +2951,11 @@ mod tests {
     #[test]
     fn safe_status_diagnostics_are_actionable() {
         for (status, hint) in [
-            (401, "认证"),
+            (401, "authentication"),
             (404, "endpoint"),
-            (429, "配额"),
-            (302, "重定向"),
-            (503, "服务端"),
+            (429, "quota"),
+            (302, "redirect"),
+            (503, "internal error"),
         ] {
             let error = http_status_error(status);
             assert!(error.contains(hint));
@@ -2972,7 +2972,7 @@ mod tests {
                 AgentRequest::GenerateRules
             )
             .unwrap_err_string()
-            .contains("默认关闭")
+            .contains("off by default")
         );
     }
 
@@ -3043,9 +3043,15 @@ mod tests {
         let remote = config(AgentProtocol::ChatCompletions, "https://example.com");
         assert!(test_connection(&remote).unwrap_err().contains("Keychain"));
         // 回环地址无需 Keychain：端口 9 无监听，应报传输失败而不是 panic。
+        // 断言对两种界面语言都成立（failed/timeout 或 失败/超时）。
         let local = config(AgentProtocol::ChatCompletions, "http://127.0.0.1:9/v1");
         let error = test_connection(&local).unwrap_err();
-        assert!(error.contains("失败") || error.contains("超时"));
+        assert!(
+            ["failed", "timeout", "timed out", "失败", "超时"]
+                .iter()
+                .any(|word| error.contains(word)),
+            "transport failure is explained: {error}"
+        );
     }
 
     // AgentResponse intentionally does not implement Debug (may contain provider text).

@@ -32,6 +32,9 @@ pub struct Settings {
     pub automation_interval_minutes: u64,
     #[serde(default)]
     pub agent: crate::agent::AgentConfig,
+    /// Interface language. `None` follows the system language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<crate::i18n::Lang>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -43,6 +46,7 @@ impl Default for Settings {
             automation_enabled: false,
             automation_interval_minutes: interval_default(),
             agent: crate::agent::AgentConfig::default(),
+            language: None,
         }
     }
 }

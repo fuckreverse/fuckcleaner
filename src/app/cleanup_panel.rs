@@ -91,26 +91,26 @@ fn path_list(paths: &[PathBuf]) -> String {
 }
 fn action_label(action: CleanupAction) -> &'static str {
     match action {
-        CleanupAction::Trash => "移到回收站",
-        CleanupAction::Permanent => "永久删除（不可恢复）",
+        CleanupAction::Trash => t!(Tr::CpActionTrash),
+        CleanupAction::Permanent => t!(Tr::CpActionPermanent),
     }
 }
 fn category_label(category: CleanupCategory) -> &'static str {
     match category {
-        CleanupCategory::Temporary => "临时文件",
-        CleanupCategory::Cache => "缓存",
-        CleanupCategory::Build => "构建产物",
-        CleanupCategory::Logs => "日志",
-        CleanupCategory::Downloads => "下载",
-        CleanupCategory::Backup => "备份",
-        CleanupCategory::Other => "其他",
+        CleanupCategory::Temporary => t!(Tr::CpCatTemporary),
+        CleanupCategory::Cache => t!(Tr::CpCatCache),
+        CleanupCategory::Build => t!(Tr::CpCatBuild),
+        CleanupCategory::Logs => t!(Tr::CpCatLogs),
+        CleanupCategory::Downloads => t!(Tr::CpCatDownloads),
+        CleanupCategory::Backup => t!(Tr::CpCatBackup),
+        CleanupCategory::Other => t!(Tr::CpCatOther),
     }
 }
 fn source_label(source: RuleSource) -> &'static str {
     match source {
-        RuleSource::BuiltIn => "内置",
-        RuleSource::User => "用户",
-        RuleSource::Ai => "AI 草案（用户采用）",
+        RuleSource::BuiltIn => t!(Tr::CpSourceBuiltIn),
+        RuleSource::User => t!(Tr::CpSourceUser),
+        RuleSource::Ai => t!(Tr::CpSourceAi),
     }
 }
 fn field(label: &str, entity: &Entity<TextInput>) -> gpui::Div {
@@ -173,10 +173,10 @@ impl PanelState {
             response: None,
             editor: None,
             url: input(config.base_url, "https://api.openai.com", false, cx),
-            model: input(config.model, "模型名称", false, cx),
-            key: input("", "新 API key；留空保留原密钥", true, cx),
-            whitelist: input("", "保护路径；多个路径用分号分隔", false, cx),
-            interval: input(minutes.to_string(), "1–10080 分钟", false, cx),
+            model: input(config.model, t!(Tr::CpFieldModel), false, cx),
+            key: input("", t!(Tr::CpFieldNewKey), true, cx),
+            whitelist: input("", t!(Tr::CpFieldProtectedPaths), false, cx),
+            interval: input(minutes.to_string(), t!(Tr::CpFieldInterval), false, cx),
             history: vec![],
             history_busy: false,
             history_sequence: 0,
@@ -226,26 +226,26 @@ impl RuleEditor {
             rule.enabled = false;
         }
         Self {
-            name: input(rule.name.clone(), "规则名称", false, cx),
-            description: input(rule.description.clone(), "描述", false, cx),
+            name: input(rule.name.clone(), t!(Tr::CpFieldRuleName), false, cx),
+            description: input(rule.description.clone(), t!(Tr::CpFieldDescription), false, cx),
             roots: input(
                 path_list(&rule.roots),
-                "~/Library/Caches；分号分隔",
+                t!(Tr::CpFieldScopes),
                 false,
                 cx,
             ),
             pattern: input(rule.pattern.clone(), "**/*", false, cx),
-            exclude: input(rule.exclude.join("; "), "排除 glob；分号分隔", false, cx),
-            size: input(rule.min_size.to_string(), "最小字节数", false, cx),
+            exclude: input(rule.exclude.join("; "), t!(Tr::CpFieldExcludeGlobs), false, cx),
+            size: input(rule.min_size.to_string(), t!(Tr::CpFieldMinBytes), false, cx),
             days: input(
                 rule.older_than_days
                     .map(|d| d.to_string())
                     .unwrap_or_default(),
-                "保留天数；空为不限",
+                t!(Tr::CpFieldKeepDays),
                 false,
                 cx,
             ),
-            priority: input(rule.priority.to_string(), "优先级（整数）", false, cx),
+            priority: input(rule.priority.to_string(), t!(Tr::CpFieldPriority), false, cx),
             rule,
             open_revision: 0,
             draft_token: None,
@@ -262,16 +262,16 @@ impl RuleEditor {
             .collect();
         rule.min_size = text(&self.size, cx)
             .parse()
-            .map_err(|_| "最小大小必须是非负字节数")?;
+            .map_err(|_| t!(Tr::CpErrMinSize))?;
         let days = text(&self.days, cx);
         rule.older_than_days = if days.is_empty() {
             None
         } else {
-            Some(days.parse().map_err(|_| "保留天数必须是非负整数")?)
+            Some(days.parse().map_err(|_| t!(Tr::CpErrKeepDays))?)
         };
         rule.priority = text(&self.priority, cx)
             .parse()
-            .map_err(|_| "优先级必须是整数")?;
+            .map_err(|_| t!(Tr::CpErrPriority))?;
         rule.source = RuleSource::User;
         rule.validate()?;
         Ok(rule)
@@ -307,17 +307,14 @@ impl Petal {
             .as_ref()
             .is_some_and(|editor| editor.draft_token.is_some())
         {
-            p.message = "扫描或配置已改变：草案编辑输入已保留，但不可保存过期草案。".into();
+            p.message = t!(Tr::CpDraftStale).into();
         }
     }
     fn stop_panel_cleanup(&mut self, cx: &mut Context<Self>) {
         self.cleanup_panel
             .execution_cancel
             .store(true, Ordering::Release);
-        self.panel_message(
-            "已请求停止当前清理：停止后续文件，不恢复已清理文件；请等待执行报告。",
-            cx,
-        );
+        self.panel_message(t!(Tr::CpStopRequested), cx);
     }
     fn disable_panel_automation(&mut self, cx: &mut Context<Self>) {
         // Cancellation is immediate even if persisting the revocation fails.
@@ -334,21 +331,31 @@ impl Petal {
                 self.cleanup_panel.revision = self.cleanup_panel.revision.wrapping_add(1);
                 self.cleanup_panel.last_automatic = Instant::now();
                 self.invalidate_cleanup_jobs();
-                self.panel_message("全局自动清理已关闭并保存；当前批次已请求停止后续文件，不恢复已清理文件。编辑输入保留，旧版本不可保存。", cx);
+                self.panel_message(t!(Tr::CpAutoDisabledSaved), cx);
             }
-            Err(e) => self.panel_message(
-                format!("当前批次已请求停止，但关闭自动清理未能保存：{e}；请重试关闭。"),
-                cx,
-            ),
+            Err(e) => self.panel_message(tf!(Tr::CpAutoDisableSaveFailed, "e" => e), cx),
         }
     }
     fn panel_message(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.cleanup_panel.message = message.into();
         cx.notify();
     }
+    fn set_panel_language(&mut self, lang: crate::i18n::Lang, cx: &mut Context<Self>) {
+        crate::i18n::set_lang(lang);
+        // The language changes no cleanup-affecting configuration, so saving it
+        // must not bump the revision or disturb a running batch: the editor and
+        // the preview plan stay valid.
+        if let Ok(mut next) = self.cleanup_panel.settings.clone() {
+            next.language = Some(lang);
+            if next.save().is_ok() {
+                self.cleanup_panel.settings = Ok(next);
+            }
+        }
+        cx.notify();
+    }
     fn save_panel_settings(&mut self, next: Settings, cx: &mut Context<Self>) -> bool {
         if !self.cleanup_panel.writable() {
-            self.panel_message("配置不可写或操作正在进行，未保存。", cx);
+            self.panel_message(t!(Tr::CpSettingsNotSaved), cx);
             return false;
         }
         match next.validate().and_then(|_| next.save()) {
@@ -358,12 +365,12 @@ impl Petal {
                 self.cleanup_panel.last_automatic = Instant::now();
                 self.invalidate_cleanup_jobs();
                 self.panel_message(if self.cleanup_panel.editor.is_some() {
-                    "配置已保存；编辑输入已保留，但其打开版本已过期，保存将拒绝冲突。旧预览和 AI 响应已失效。"
-                } else { "配置已保存；旧预览和 AI 响应已失效，请重新预览。" }, cx);
+                    t!(Tr::CpSettingsSavedStale)
+                } else { t!(Tr::CpSettingsSavedInvalidate) }, cx);
                 true
             }
             Err(e) => {
-                self.panel_message(format!("保存失败，内存配置未改变：{e}"), cx);
+                self.panel_message(tf!(Tr::CpSaveFailed, "e" => e), cx);
                 false
             }
         }
@@ -386,7 +393,7 @@ impl Petal {
             PromptLevel::Warning,
             title,
             Some(detail),
-            &["明确授权并保存", "取消"],
+            &[t!(Tr::CpAuthorizeAndSave), t!(Tr::Cancel)],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -396,7 +403,7 @@ impl Petal {
                         this.save_panel_settings(next, cx);
                     } else {
                         this.panel_message(
-                            "确认期间配置或扫描改变：未保存，规则编辑输入已保留。",
+                            t!(Tr::CpSettingsChangedDuringConfirm),
                             cx,
                         );
                     }
@@ -428,7 +435,7 @@ impl Petal {
                 .interval
                 .update(cx, |input, cx| input.set_text(minutes, cx));
         }
-        self.panel_message("已重新读取配置；规则编辑输入保留但打开版本已过期。读取失败时仍保持禁用，不覆盖原文件。", cx);
+        self.panel_message(t!(Tr::CpReloadedStale), cx);
     }
     // Preview must cover every scope file: retain the full snapshot until core provides
     // a scope-complete snapshot helper. This copy can be expensive; never use it for AI.
@@ -474,7 +481,7 @@ impl Petal {
         self.cleanup_panel.selected.clear();
         self.cleanup_panel.diagnostic_page = 0;
         self.cleanup_panel.preview_busy = true;
-        self.panel_message("正在后台核对文件元数据与规则…", cx);
+        self.panel_message(t!(Tr::CpVerifying), cx);
         cx.spawn(async move |this, cx| {
             let worker_cancel = cancel.clone();
             let plan = cx
@@ -499,7 +506,7 @@ impl Petal {
                 }
                 if automatic {
                     if scan_integrity_errors || !this.cleanup_ready() {
-                        this.panel_message("自动计划不完整或扫描状态改变，本轮未执行。", cx);
+                        this.panel_message(t!(Tr::CpAutoPlanIncomplete), cx);
                         return;
                     }
                     let items = plan
@@ -515,8 +522,7 @@ impl Petal {
                 } else {
                     this.cleanup_panel.selected.clear();
                     this.cleanup_panel.page = 0;
-                    this.cleanup_panel.message =
-                        format!("预览完成：{} 个候选文件；默认全不选。", plan.items.len());
+                    this.cleanup_panel.message = tf!(Tr::CpPreviewDone, "n" => plan.items.len());
                     this.cleanup_panel.plan = Some((token, plan));
                     cx.notify();
                 }
@@ -530,7 +536,7 @@ impl Petal {
             .preview_cancel
             .store(true, Ordering::Release);
         self.cleanup_panel.preview_busy = false;
-        self.panel_message("已取消规则核对；本轮不执行自动清理。", cx);
+        self.panel_message(t!(Tr::CpPreviewCancelled), cx);
     }
     fn confirm_panel_cleanup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.cleanup_ready() {
@@ -568,16 +574,17 @@ impl Petal {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let detail = format!(
-            "{} 个文件，其中 {} 个永久删除。\n移到回收站不会立即释放磁盘空间；可手动恢复，原路径见记录。Finder『放回』可能仅回到暂存目录，之后需按记录手动移回原位置；没有『放回』时从回收站取出原名文件。\n大小仅为扫描估计。\n\n{details}",
-            items.len(),
-            permanent
+        let detail = tf!(
+            Tr::CpExecuteSummary,
+            "n" => items.len(),
+            "permanent" => permanent,
+            "details" => details
         );
         let answer = window.prompt(
             PromptLevel::Warning,
-            "确认清理已选择的预览文件？",
+            t!(Tr::CpConfirmExecute),
             Some(&detail),
-            &["继续", "取消"],
+            &[t!(Tr::CpContinue), t!(Tr::Cancel)],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -594,9 +601,9 @@ impl Petal {
                 let second = cx.update(|window, cx| {
                     window.prompt(
                         PromptLevel::Warning,
-                        "永久删除不可恢复",
+                        t!(Tr::CpPermanentWarning),
                         Some(&permanent_detail),
-                        &["确认永久删除这些文件", "取消"],
+                        &[t!(Tr::CpConfirmPermanent), t!(Tr::Cancel)],
                         cx,
                     )
                 });
@@ -638,7 +645,7 @@ impl Petal {
         let cancel = self.cleanup_panel.execution_cancel.clone();
         self.cleanup_panel.cleanup_busy = true;
         self.cleanup_panel.execution_started = true;
-        self.panel_message("正在清理；配置和扫描切换已暂时锁定。", cx);
+        self.panel_message(t!(Tr::CpBusyLocked), cx);
         cx.spawn(async move |this, cx| {
             let report = cx
                 .background_spawn(async move {
@@ -700,19 +707,22 @@ impl Petal {
         let failures = report
             .failed
             .iter()
-            .map(|(p, e)| format!("{}：{e}", p.display()))
+            .map(|(p, e)| tf!(Tr::CpFailEntry, "path" => p.display().to_string(), "e" => e))
             .collect::<Vec<_>>()
             .join("\n");
         self.panel_message(
-            format!(
-                "完成 {} 个文件，失败 {} 个。移到回收站不等于已释放空间。\n{}{}",
-                report.completed.len(),
-                report.failed.len(),
-                failures,
-                report
-                    .log_error
-                    .map(|e| format!("\n审计记录错误：{e}"))
-                    .unwrap_or_default()
+            tf!(
+                Tr::CpExecuteResult,
+                "n" => report.completed.len(),
+                "failed" => report.failed.len(),
+                "tail" => format!(
+                    "{}{}",
+                    failures,
+                    report
+                        .log_error
+                        .map(|e| tf!(Tr::CpAuditError, "e" => e))
+                        .unwrap_or_default()
+                )
             ),
             cx,
         );
@@ -729,10 +739,7 @@ impl Petal {
         }
         let draft_token = draft.as_ref().and_then(|_| self.cleanup_token());
         if self.cleanup_panel.editor.is_some() {
-            self.panel_message(
-                "已有未关闭的规则编辑，请先保存或明确取消；不会覆盖输入。",
-                cx,
-            );
+            self.panel_message(t!(Tr::CpEditorAlreadyOpen), cx);
             return;
         }
         let mut editor = RuleEditor::new(rule, draft, cx);
@@ -751,7 +758,7 @@ impl Petal {
             id: crate::settings::unique_name("user-")
                 .to_string_lossy()
                 .into_owned(),
-            name: "新缓存规则".into(),
+            name: t!(Tr::CpNewCacheRule).into(),
             description: String::new(),
             category: CleanupCategory::Cache,
             roots: vec![PathBuf::from("~/Library/Caches")],
@@ -775,20 +782,20 @@ impl Petal {
             return;
         };
         if editor_conflict(editor.open_revision, self.cleanup_panel.revision) {
-            self.panel_message("规则编辑版本冲突：配置已改变，输入已保留。请复制所需输入后取消编辑，并重新打开最新规则。", cx);
+            self.panel_message(t!(Tr::CpEditorConflict), cx);
             return;
         }
         if editor
             .draft_token
             .is_some_and(|token| !self.cleanup_current(token))
         {
-            self.panel_message("草案所属扫描或配置已改变，请重新生成草案。", cx);
+            self.panel_message(t!(Tr::CpDraftScanChanged), cx);
             return;
         }
         let rule = match editor.build(cx) {
             Ok(rule) => rule,
             Err(e) => {
-                self.panel_message(format!("规则验证失败：{e}"), cx);
+                self.panel_message(tf!(Tr::CpRuleInvalid, "e" => e), cx);
                 return;
             }
         };
@@ -804,17 +811,17 @@ impl Petal {
             let revision = editor.open_revision;
             let token = self.cleanup_token();
             let expected = serde_json::to_string(&rule).ok();
-            let detail = format!(
-                "{}\n范围：{}\n仅本地缓存/日志白名单，至少保留 7 天，仅回收站；全局开关另行授权。",
-                rule.name,
-                path_list(&rule.roots)
+            let detail = tf!(
+                Tr::CpAutoRuleSummary,
+                "name" => rule.name,
+                "scope" => path_list(&rule.roots)
             );
             window.focus(&self.focus_handle, cx);
             let answer = window.prompt(
                 PromptLevel::Warning,
-                "授权此单条规则自动清理？",
+                t!(Tr::CpAuthorizeSingleRule),
                 Some(&detail),
-                &["授权并保存此规则", "取消"],
+                &[t!(Tr::CpAuthorizeSaveRule), t!(Tr::Cancel)],
                 cx,
             );
             cx.spawn_in(window, async move |this, cx| {
@@ -834,7 +841,7 @@ impl Petal {
                         || token != this.cleanup_token()
                         || !unchanged
                     {
-                        this.panel_message("确认期间配置或编辑输入改变：未保存，输入已保留。", cx);
+                        this.panel_message(t!(Tr::CpConfirmChangedInputs), cx);
                         return;
                     }
                     if this.save_panel_settings(next, cx) {
@@ -886,10 +893,7 @@ impl Petal {
         next.agent.base_url = text(&self.cleanup_panel.url, cx);
         next.agent.model = text(&self.cleanup_panel.model, cx);
         if self.save_panel_settings(next, cx) {
-            self.panel_message(
-                "AI 配置已保存。新密钥请单独点击『保存密钥』；空输入不会删除原密钥。",
-                cx,
-            );
+            self.panel_message(t!(Tr::CpAiSavedNotice), cx);
         }
     }
     fn panel_credential_target(&self, cx: &Context<Self>) -> Result<String, String> {
@@ -907,9 +911,7 @@ impl Petal {
             || config.model != settings.agent.model
             || scope != settings.agent.credential_scope()?
         {
-            return Err(
-                "连接配置尚未保存：请先保存当前地址、协议和模型，再操作该目标的密钥。".into(),
-            );
+            return Err(t!(Tr::CpKeyTargetUnsaved).into());
         }
         Ok(scope)
     }
@@ -926,14 +928,12 @@ impl Petal {
         };
         let revision = self.cleanup_panel.revision;
         window.focus(&self.focus_handle, cx);
-        let detail = format!(
-            "仅删除以下目标的凭据：{scope}。其他 origin/协议的密钥保持不变。空输入不会删除密钥。"
-        );
+        let detail = tf!(Tr::CpDeleteKeyScope, "scope" => scope);
         let answer = window.prompt(
             PromptLevel::Warning,
-            "删除指定目标的 AI 密钥？",
+            t!(Tr::CpConfirmDeleteKey),
             Some(&detail),
-            &["删除此目标密钥", "取消"],
+            &[t!(Tr::CpDeleteTargetKey), t!(Tr::Cancel)],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -944,7 +944,7 @@ impl Petal {
                 if revision != this.cleanup_panel.revision
                     || this.panel_credential_target(cx).ok().as_ref() != Some(&scope)
                 {
-                    this.panel_message("凭据目标或配置已改变：删除已取消，未操作其他账户。", cx);
+                    this.panel_message(t!(Tr::CpKeyTargetChanged), cx);
                     return;
                 }
                 this.store_panel_key(true, cx);
@@ -969,7 +969,7 @@ impl Petal {
         let key = text(&self.cleanup_panel.key, cx);
         let submitted_key = key.clone();
         if !delete && key.is_empty() {
-            self.panel_message("未输入新密钥，原密钥保持不变。", cx);
+            self.panel_message(t!(Tr::CpKeyEmpty), cx);
             return;
         }
         self.cleanup_panel.key_busy = true;
@@ -988,14 +988,21 @@ impl Petal {
                 match result {
                     Ok(()) => {
                         if this.cleanup_panel.revision != revision || this.panel_credential_target(cx).ok().as_ref() != Some(&target) {
-                            this.panel_message(format!("Keychain 操作已完成，目标：{target}；当前表单已改变，未清空新输入，也不代表新目标已配置。"), cx); return;
+                            this.panel_message(tf!(Tr::CpKeychainDoneStale, "target" => target), cx); return;
                         }
                         if text(&this.cleanup_panel.key, cx) == submitted_key {
                             this.cleanup_panel.key.update(cx, |input, cx| input.set_text("", cx));
                         }
-                        this.panel_message(format!("{} 目标：{target}", if delete { "Keychain 密钥已删除。" } else { "密钥已保存到 Keychain，输入已清空。" }), cx);
+                        this.panel_message(
+                            if delete {
+                                tf!(Tr::CpKeychainDeleted, "target" => target)
+                            } else {
+                                tf!(Tr::CpKeychainSaved, "target" => target)
+                            },
+                            cx,
+                        );
                     }
-                    Err(e) => this.panel_message(format!("Keychain 操作失败：{e}"), cx),
+                    Err(e) => this.panel_message(tf!(Tr::CpKeychainFailed, "e" => e), cx),
                 }
             })
             .ok();
@@ -1011,21 +1018,19 @@ impl Petal {
         };
         let config = settings.agent;
         if let Err(e) = config.validate() {
-            self.panel_message(format!("已保存的 AI 配置无效：{e}"), cx);
+            self.panel_message(tf!(Tr::CpAiConfigInvalid, "e" => e), cx);
             return;
         }
         let target = config
             .credential_scope()
-            .unwrap_or_else(|_| "本地回环服务".into());
-        let detail = format!(
-            "将向 {target} 发送一条固定的连通性探测消息（不含扫描数据、路径或文件内容），用于验证地址、密钥与模型可用性。测试使用已保存的配置；若刚修改表单请先保存。"
-        );
+            .unwrap_or_else(|_| t!(Tr::CpLocalLoopback).into());
+        let detail = tf!(Tr::CpTestExplain, "target" => target);
         window.focus(&self.focus_handle, cx);
         let answer = window.prompt(
             PromptLevel::Warning,
-            "发送 AI 连接测试探测？",
+            t!(Tr::CpConfirmTest),
             Some(&detail),
-            &["发送探测", "取消"],
+            &[t!(Tr::CpSendProbe), t!(Tr::Cancel)],
             cx,
         );
         self.cleanup_panel.test_busy = true;
@@ -1034,13 +1039,13 @@ impl Petal {
                 cx.background_spawn(async move { agent::test_connection(&config) })
                     .await
             } else {
-                Err("已取消，未发送探测。".into())
+                Err(t!(Tr::CpTestCancelled).into())
             };
             this.update(cx, |this, cx| {
                 this.cleanup_panel.test_busy = false;
                 match result {
                     Ok(message) => this.panel_message(message, cx),
-                    Err(e) => this.panel_message(format!("AI 连接测试失败：{e}"), cx),
+                    Err(e) => this.panel_message(tf!(Tr::CpTestFailed, "e" => e), cx),
                 }
                 cx.notify();
             })
@@ -1082,7 +1087,7 @@ impl Petal {
             return;
         };
         if !settings.agent.enabled {
-            self.panel_message("请先知情同意并启用 AI。", cx);
+            self.panel_message(t!(Tr::CpAiNotEnabled), cx);
             return;
         }
         let Some(token) = self.cleanup_token() else {
@@ -1092,29 +1097,29 @@ impl Petal {
             Screen::Results(r) => r.tree.nodes.len(),
             _ => return,
         };
-        let detail = format!(
-            "发送到：{}\n协议：{}；模型：{}\n扫描 {} 个节点，摘要最多 200 项，包含大小、数量、分类、规则保留信息与风险；不读取文件内容、不运行脚本、不执行清理。\n路径：{}\n确认后构造有界元数据快照，再在后台准备摘要并发送，取消只丢弃结果，已发出的网络请求不能撤回。",
-            settings.agent.base_url,
-            settings.agent.protocol.label(),
-            settings.agent.model,
-            node_count,
-            if settings.agent.share_paths {
-                "完整路径（可能包含私人信息）"
+        let detail = tf!(
+            Tr::CpAnalyzeExplain,
+            "target" => settings.agent.base_url,
+            "protocol" => settings.agent.protocol.label(),
+            "model" => settings.agent.model,
+            "nodes" => node_count,
+            "paths" => if settings.agent.share_paths {
+                t!(Tr::CpPathsFull)
             } else {
-                "opaque 标识，仅已知目录结构"
+                t!(Tr::CpPathsOpaque)
             }
         );
         let answer = window.prompt(
             PromptLevel::Warning,
-            "确认向 AI 发送当前磁盘元数据摘要？",
+            t!(Tr::CpConfirmAnalyze),
             Some(&detail),
-            &["发送只读摘要", "取消"],
+            &[t!(Tr::CpSendSummary), t!(Tr::Cancel)],
             cx,
         );
         self.cleanup_panel.ai_busy = true;
         self.cleanup_panel.ai_sequence = self.cleanup_panel.ai_sequence.wrapping_add(1);
         let sequence = self.cleanup_panel.ai_sequence;
-        self.panel_message("等待确认；AI 仅提供建议，不会自动采用规则。", cx);
+        self.panel_message(t!(Tr::CpWaitingConsent), cx);
         cx.spawn(async move |this, cx| {
             if answer.await != Ok(0) {
                 this.update(cx, |this, cx| {
@@ -1207,10 +1212,7 @@ impl Petal {
                 match response {
                     Ok(response) => {
                         this.cleanup_panel.response = Some((token, response));
-                        this.panel_message(
-                            "AI 返回只读建议。草案默认不启用，逐条采用后须重新预览。",
-                            cx,
-                        );
+                        this.panel_message(t!(Tr::CpAdvisoryNotice), cx);
                     }
                     Err(e) => this.panel_message(e, cx),
                 }
@@ -1268,12 +1270,9 @@ impl Petal {
                         history.reverse();
                         history.truncate(PAGE_SIZE);
                         this.cleanup_panel.history = history;
-                        this.panel_message(
-                            "已加载最近 200 条记录。不会自动恢复或删除暂存文件。",
-                            cx,
-                        );
+                        this.panel_message(t!(Tr::CpHistoryLoaded), cx);
                     }
-                    Err(e) => this.panel_message(format!("读取记录失败：{e}"), cx),
+                    Err(e) => this.panel_message(tf!(Tr::CpHistoryFailed, "e" => e), cx),
                 }
             })
             .ok();
@@ -1286,7 +1285,7 @@ impl Petal {
         let mut tabs = row();
         if p.cleanup_busy {
             tabs = tabs.child(
-                button("stop-current-cleanup", "停止当前清理")
+                button("stop-current-cleanup", t!(Tr::CpStopCurrentCleanup))
                     .on_click(cx.listener(|this, _, _, cx| this.stop_panel_cleanup(cx))),
             );
         }
@@ -1295,11 +1294,11 @@ impl Petal {
             .is_ok_and(|settings| settings.automation_enabled)
         {
             tabs = tabs.child(
-                button("disable-auto-now", "关闭自动清理")
+                button("disable-auto-now", t!(Tr::CpDisableAutoNow))
                     .on_click(cx.listener(|this, _, _, cx| this.disable_panel_automation(cx))),
             );
         }
-        for (i, label) in ["清理预览", "规则管理", "AI助手", "设置与记录"]
+        for (i, label) in [t!(Tr::CpTabPreview), t!(Tr::CpTabRules), t!(Tr::CpTabAi), t!(Tr::CpTabSettings)]
             .iter()
             .enumerate()
         {
@@ -1326,11 +1325,12 @@ impl Petal {
             body = body.child(
                 panel_card()
                     .text_color(rgb(WARNING))
-                    .child(format!(
-                        "配置读取失败：{error}\n保存、清理和 AI 已禁用，不会用默认值覆盖坏文件。"
+                    .child(tf!(
+                        Tr::CpBadSettings,
+                        "error" => error
                     ))
                     .child(
-                        button("reload-bad-settings", "重载配置").on_click(cx.listener(
+                        button("reload-bad-settings", t!(Tr::CpReloadConfig)).on_click(cx.listener(
                             |this, _, window, cx| {
                                 window.focus(&this.focus_handle, cx);
                                 this.reload_panel_settings(cx);
@@ -1365,30 +1365,34 @@ impl Petal {
     }
     fn render_cleanup_preview(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = &self.cleanup_panel;
-        let mut view = panel_card().child("仅普通文件候选；核对在后台执行。当前预览需复制完整扫描树，大型扫描可能短暂阻塞界面；不会截断范围内文件。预览不是删除授权；回收站不会立即释放空间。")
-            .child(row().child(button("preview-rules", if p.preview_busy { "重新生成（取消旧核对）" } else { "生成清理预览" }).when(!self.cleanup_ready(), |d| d.opacity(0.4))
+        let mut view = panel_card().child(t!(Tr::CpPreviewIntro))
+            .child(row().child(button("preview-rules", if p.preview_busy { t!(Tr::CpRegenerate) } else { t!(Tr::CpGeneratePreview) }).when(!self.cleanup_ready(), |d| d.opacity(0.4))
                 .on_click(cx.listener(|this, _, _, cx| this.preview_cleanup(false, cx))))
-                .child(button("cancel-preview", "取消核对").when(!p.preview_busy, |d| d.opacity(0.4))
+                .child(button("cancel-preview", t!(Tr::CpCancelVerify)).when(!p.preview_busy, |d| d.opacity(0.4))
                     .on_click(cx.listener(|this, _, _, cx| this.cancel_cleanup_preview(cx))))
-                .child(button("select-trash", "选择全部：仅回收站").on_click(cx.listener(|this, _, _, cx| {
+                .child(button("select-trash", t!(Tr::CpSelectSafe)).on_click(cx.listener(|this, _, _, cx| {
                     if let Some((token, plan)) = &this.cleanup_panel.plan {
                         if this.cleanup_current(*token) { this.cleanup_panel.selected = plan.items.iter().filter(|i| is_trash(i.action)).map(|i| i.path.clone()).collect(); }
                     } cx.notify();
                 })))
-                .child(button("clear-selection", "清空选择").on_click(cx.listener(|this, _, _, cx| { this.cleanup_panel.selected.clear(); cx.notify(); })))
-                .child(button("execute-preview", format!("确认清理（{}）", p.selected.len())).when(p.selected.is_empty() || !self.cleanup_ready(), |d| d.opacity(0.4))
+                .child(button("clear-selection", t!(Tr::CpClearSelection)).on_click(cx.listener(|this, _, _, cx| { this.cleanup_panel.selected.clear(); cx.notify(); })))
+                .child(button("execute-preview", tf!(Tr::CpConfirmCount, "n" => p.selected.len())).when(p.selected.is_empty() || !self.cleanup_ready(), |d| d.opacity(0.4))
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_panel_cleanup(window, cx)))));
         if let Screen::Results(results) = &self.screen {
-            view = view.child(div().text_color(rgb(WARNING)).child(format!(
-                "扫描完整性（不可选择）：读取错误 {}；云端未下载 {}；不可读目录 {}；结果过期 {}。未知空间不作为可清理文件。",
-                results.tree.errors, results.tree.cloud_only, results.tree.unreadable.len(), if results.out_of_date { "是，请重新扫描" } else { "否" })));
+            view = view.child(div().text_color(rgb(WARNING)).child(tf!(
+                Tr::CpIntegrityNote,
+                "errors" => results.tree.errors,
+                "cloud" => results.tree.cloud_only,
+                "unreadable" => results.tree.unreadable.len(),
+                "stale" => if results.out_of_date { t!(Tr::CpRescanYes) } else { t!(Tr::CpNo) }
+            )));
         }
         let Some((token, plan)) = &p.plan else {
-            return view.child("请先完成扫描并生成预览。扫描过期或更新后需重新生成。");
+            return view.child(t!(Tr::CpNeedScanFirst));
         };
         let token = *token;
         if !self.cleanup_current(token) {
-            return view.child("预览已过期，请重新生成。");
+            return view.child(t!(Tr::CpPreviewStale));
         }
         let mut summary = std::collections::BTreeMap::<String, (usize, u64)>::new();
         for item in &plan.items {
@@ -1401,7 +1405,7 @@ impl Petal {
         view = view.child(
             summary
                 .into_iter()
-                .map(|(k, (n, bytes))| format!("{k}：{n} 项 / {}", format_size(bytes)))
+                .map(|(k, (n, bytes))| tf!(Tr::CpRuleSummaryLine, "rule" => k, "n" => n, "size" => format_size(bytes)))
                 .collect::<Vec<_>>()
                 .join(" · "),
         );
@@ -1413,14 +1417,10 @@ impl Petal {
         view = view.child(
             button(
                 "expand-preview-diagnostics",
-                format!(
-                    "{}诊断明细（{} 条，不可选择）",
-                    if p.diagnostics_expanded {
-                        "收起"
-                    } else {
-                        "展开"
-                    },
-                    diagnostic_count
+                tf!(
+                    Tr::CpDiagnosticsTitle,
+                    "phase" => if p.diagnostics_expanded { t!(Tr::CpCollapse) } else { t!(Tr::CpExpand) },
+                    "n" => diagnostic_count
                 ),
             )
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1435,17 +1435,17 @@ impl Petal {
             let entries = plan
                 .errors
                 .iter()
-                .map(|e| format!("错误：{e}"))
-                .chain(plan.blocked.iter().map(|e| format!("保护/阻止：{e}")))
+                .map(|e| tf!(Tr::CpDiagError, "e" => e))
+                .chain(plan.blocked.iter().map(|e| tf!(Tr::CpDiagProtected, "e" => e)))
                 .chain(
                     unreadable
                         .iter()
-                        .map(|u| format!("不可读：{}（{} 个错误）", u.path.display(), u.errors)),
+                        .map(|u| tf!(Tr::CpDiagUnreadable, "path" => u.path.display().to_string(), "n" => u.errors)),
                 );
-            let mut diagnostics = panel_card().text_color(rgb(WARNING)).child(format!(
-                "诊断第 {} / {} 页，每页最多 200 条；所有诊断不可选择。",
-                page + 1,
-                diagnostic_count.div_ceil(PAGE_SIZE).max(1)
+            let mut diagnostics = panel_card().text_color(rgb(WARNING)).child(tf!(
+                Tr::CpDiagnosticsPage,
+                "page" => page + 1,
+                "pages" => diagnostic_count.div_ceil(PAGE_SIZE).max(1)
             ));
             for entry in entries.skip(page * PAGE_SIZE).take(PAGE_SIZE) {
                 diagnostics = diagnostics.child(entry);
@@ -1453,7 +1453,7 @@ impl Petal {
             diagnostics = diagnostics.child(
                 row()
                     .child(
-                        button("diagnostics-prev", "上一页诊断").on_click(cx.listener(
+                        button("diagnostics-prev", t!(Tr::CpDiagnosticsPrev)).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.cleanup_panel.diagnostic_page =
                                     this.cleanup_panel.diagnostic_page.saturating_sub(1);
@@ -1462,7 +1462,7 @@ impl Petal {
                         )),
                     )
                     .child(
-                        button("diagnostics-next", "下一页诊断").on_click(cx.listener(
+                        button("diagnostics-next", t!(Tr::CpDiagnosticsNext)).on_click(cx.listener(
                             move |this, _, _, cx| {
                                 if (this.cleanup_panel.diagnostic_page + 1) * PAGE_SIZE
                                     < diagnostic_count
@@ -1476,12 +1476,12 @@ impl Petal {
             );
             view = view.child(diagnostics);
         }
-        view = view.child(format!(
-            "保护/阻止共 {} 项，跳过 {} 项（诊断明细可能截断）；按规则优先级显示。第 {} 页 / {} 页，每页最多 200 项。",
-            plan.blocked_total,
-            plan.skipped_total,
-            p.page + 1,
-            plan.items.len().div_ceil(PAGE_SIZE).max(1)
+        view = view.child(tf!(
+            Tr::CpBlockedSummary,
+            "n" => plan.blocked_total,
+            "skipped" => plan.skipped_total,
+            "page" => p.page + 1,
+            "pages" => plan.items.len().div_ceil(PAGE_SIZE).max(1)
         ));
         for (i, item) in plan
             .items
@@ -1500,7 +1500,7 @@ impl Petal {
                             .child(
                                 button(
                                     ("preview-check", i),
-                                    if selected { "已选择" } else { "选择" },
+                                    if selected { t!(Tr::CpSelected) } else { t!(Tr::CpSelect) },
                                 )
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
@@ -1515,14 +1515,14 @@ impl Petal {
                                     },
                                 )),
                             )
-                            .child(format!(
-                                "{} · {} · 优先级 {} · {}",
-                                category_label(item.category),
-                                format_size(item.size),
-                                item.priority,
-                                action_label(item.action)
+                            .child(tf!(
+                                Tr::CpRowMeta,
+                                "category" => category_label(item.category),
+                                "size" => format_size(item.size),
+                                "priority" => item.priority,
+                                "action" => action_label(item.action)
                             ))
-                            .child(button(("protect-file", i), "排除并保护").on_click(
+                            .child(button(("protect-file", i), t!(Tr::CpExcludedProtected)).on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     let Ok(mut next) = this.cleanup_panel.settings.clone() else {
                                         return;
@@ -1535,19 +1535,19 @@ impl Petal {
                             )),
                     )
                     .child(item.path.display().to_string())
-                    .child(format!("{}：{}", item.rule_name, item.reason)),
+                    .child(tf!(Tr::CpReason, "rule" => item.rule_name, "reason" => item.reason)),
             );
         }
         view.child(
             row()
                 .child(
-                    button("preview-prev", "上一页").on_click(cx.listener(|this, _, _, cx| {
+                    button("preview-prev", t!(Tr::CpPrevPage)).on_click(cx.listener(|this, _, _, cx| {
                         this.cleanup_panel.page = this.cleanup_panel.page.saturating_sub(1);
                         cx.notify();
                     })),
                 )
                 .child(
-                    button("preview-next", "下一页").on_click(cx.listener(|this, _, _, cx| {
+                    button("preview-next", t!(Tr::CpNextPage)).on_click(cx.listener(|this, _, _, cx| {
                         if let Some((_, plan)) = &this.cleanup_panel.plan {
                             if (this.cleanup_panel.page + 1) * PAGE_SIZE < plan.items.len() {
                                 this.cleanup_panel.page += 1;
@@ -1563,33 +1563,33 @@ impl Petal {
         let mut view =
             panel_card().child(
                 row()
-                    .child(button("new-rule", "新增规则（默认停用）").on_click(
+                    .child(button("new-rule", t!(Tr::CpNewRule)).on_click(
                         cx.listener(|this, _, window, cx| this.new_panel_rule(window, cx)),
                     ))
-                    .child("修改内置或 AI 规则转为用户规则，自动授权重新确认；停用不会删除规则。"),
+                    .child(t!(Tr::CpRulesIntro)),
             );
         if let Some(editor) = &p.editor {
             view = view.child(
                 panel_card()
-                    .child("规则编辑 · 路径、排除项使用分号分隔（单行）")
-                    .when(editor_conflict(editor.open_revision, p.revision) || editor.draft_token.is_some_and(|token| !self.cleanup_current(token)), |d| d.child(div().text_color(rgb(WARNING)).child("编辑版本或草案已过期：输入已保留，不能覆盖最新配置。请复制所需内容后明确取消，再打开最新规则。")))
-                    .child(field("名称", &editor.name))
-                    .child(field("描述", &editor.description))
-                    .child(field("范围路径", &editor.roots))
-                    .child(field("匹配 glob", &editor.pattern))
-                    .child(field("排除 glob", &editor.exclude))
-                    .child(field("最小大小（字节）", &editor.size))
-                    .child(field("保留天数", &editor.days))
-                    .child(field("优先级", &editor.priority))
+                    .child(t!(Tr::CpEditorHint))
+                    .when(editor_conflict(editor.open_revision, p.revision) || editor.draft_token.is_some_and(|token| !self.cleanup_current(token)), |d| d.child(div().text_color(rgb(WARNING)).child(t!(Tr::CpEditorStaleWarning))))
+                    .child(field(t!(Tr::CpFieldName), &editor.name))
+                    .child(field(t!(Tr::CpFieldDescription), &editor.description))
+                    .child(field(t!(Tr::CpFieldScopePaths), &editor.roots))
+                    .child(field(t!(Tr::CpFieldMatchGlobs), &editor.pattern))
+                    .child(field(t!(Tr::CpFieldExcludeGlobsShort), &editor.exclude))
+                    .child(field(t!(Tr::CpFieldMinSize), &editor.size))
+                    .child(field(t!(Tr::CpFieldKeepDaysShort), &editor.days))
+                    .child(field(t!(Tr::CpFieldPriorityShort), &editor.priority))
                     .child(
                         row()
                             .child(
                                 button(
                                     "edit-enabled",
                                     if editor.rule.enabled {
-                                        "已启用"
+                                        t!(Tr::CpRuleEnabled)
                                     } else {
-                                        "停用（点击显式启用）"
+                                        t!(Tr::CpRuleDisabled)
                                     },
                                 )
                                 .on_click(cx.listener(
@@ -1623,9 +1623,9 @@ impl Petal {
                                 button(
                                     "edit-auto",
                                     if editor.rule.auto_clean {
-                                        "自动：待授权"
+                                        t!(Tr::CpAutoPending)
                                     } else {
-                                        "自动：关闭"
+                                        t!(Tr::CpAutoOff)
                                     },
                                 )
                                 .on_click(cx.listener(
@@ -1669,10 +1669,10 @@ impl Petal {
             }
             view = view.child(categories).child(
                 row()
-                    .child(button("save-rule", "验证并保存规则").on_click(
+                    .child(button("save-rule", t!(Tr::CpSaveRule)).on_click(
                         cx.listener(|this, _, window, cx| this.save_panel_rule(window, cx)),
                     ))
-                    .child(button("cancel-rule", "取消编辑").on_click(cx.listener(
+                    .child(button("cancel-rule", t!(Tr::CpCancelEdit)).on_click(cx.listener(
                         |this, _, window, cx| {
                             window.focus(&this.focus_handle, cx);
                             this.cleanup_panel.editor = None;
@@ -1692,20 +1692,21 @@ impl Petal {
             let toggle_id = id.clone();
             view = view.child(
                 panel_card()
-                    .child(format!(
-                        "{} · {} · {} · 优先级 {} · 保留 {} 天 · {} · 自动 {}",
-                        rule.name,
-                        category_label(rule.category),
-                        source_label(rule.source),
-                        rule.priority,
-                        rule.older_than_days
+                    .child(tf!(
+                        Tr::CpRuleRowMeta,
+                        "name" => rule.name,
+                        "category" => category_label(rule.category),
+                        "source" => source_label(rule.source),
+                        "priority" => rule.priority,
+                        "days" => rule
+                            .older_than_days
                             .map(|d| d.to_string())
-                            .unwrap_or_else(|| "不限".into()),
-                        action_label(rule.action),
-                        if rule.auto_clean {
-                            "已授权"
+                            .unwrap_or_else(|| t!(Tr::CpNoLimit).into()),
+                        "action" => action_label(rule.action),
+                        "auto" => if rule.auto_clean {
+                            t!(Tr::CpAuthorized)
                         } else {
-                            "关闭"
+                            t!(Tr::CpOff)
                         }
                     ))
                     .child(format!("{} / {}", path_list(&rule.roots), rule.pattern))
@@ -1715,9 +1716,9 @@ impl Petal {
                                 button(
                                     ("enable-rule", i),
                                     if rule.enabled {
-                                        "启用中（点击停用）"
+                                        t!(Tr::CpEnabledOn)
                                     } else {
-                                        "停用中（点击启用）"
+                                        t!(Tr::CpDisabledOff)
                                     },
                                 )
                                 .on_click(cx.listener(
@@ -1729,9 +1730,9 @@ impl Petal {
                                             .is_some_and(|editor| editor.rule.id == toggle_id)
                                         {
                                             this.panel_message(
-                                            "此规则正在编辑，列表启停已锁定；请先保存或取消编辑。",
-                                            cx,
-                                        );
+                                                t!(Tr::CpEditingLocked),
+                                                cx,
+                                            );
                                             return;
                                         }
                                         let Ok(mut next) = this.cleanup_panel.settings.clone()
@@ -1747,12 +1748,12 @@ impl Petal {
                                     },
                                 )),
                             )
-                            .child(button(("edit-rule", i), "编辑").on_click(cx.listener(
+                            .child(button(("edit-rule", i), t!(Tr::CpEdit)).on_click(cx.listener(
                                 move |this, _, window, cx| {
                                     this.edit_panel_rule(edit.clone(), None, window, cx)
                                 },
                             )))
-                            .child(button(("delete-rule", i), "删除规则").on_click(cx.listener(
+                            .child(button(("delete-rule", i), t!(Tr::CpDeleteRule)).on_click(cx.listener(
                                 move |this, _, window, cx| {
                                     let Ok(mut next) = this.cleanup_panel.settings.clone() else {
                                         return;
@@ -1760,8 +1761,8 @@ impl Petal {
                                     next.rules.retain(|r| r.id != id);
                                     this.confirm_panel_settings(
                                         next,
-                                        "删除这条规则？",
-                                        "只删除配置中的规则，不删除任何文件。",
+                                        t!(Tr::CpConfirmDeleteRule),
+                                        t!(Tr::CpDeleteRuleNote),
                                         window,
                                         cx,
                                     );
@@ -1801,40 +1802,40 @@ impl Petal {
             );
         }
         let credential_target = match self.panel_credential_target(cx) {
-            Ok(scope) => format!("当前凭据目标：{scope}（仅此 origin + 协议；切换后不复用旧 key）"),
-            Err(e) => format!("当前凭据目标不可用：{e}"),
+            Ok(scope) => tf!(Tr::CpCurrentKeyTarget, "scope" => scope),
+            Err(e) => tf!(Tr::CpKeyTargetUnavailable, "e" => e),
         };
-        let mut view = panel_card().child("AI 只发送元数据摘要，不读取文件内容。默认关闭、隐藏完整路径；建议不是删除授权。")
+        let mut view = panel_card().child(t!(Tr::CpAiIntro))
             .child(credential_target)
-            .child(protocols).child(field("服务地址（填写后先保存，再授权启用）", &p.url)).child(field("模型", &p.model)).child(field("API key（仅 Keychain，不进配置和日志）", &p.key))
-            .child(row().child(button("ai-save", "保存 AI 配置").on_click(cx.listener(|this, _, _, cx| this.save_panel_ai(cx))))
-                .child(button("ai-key-save", if p.key_busy { "Keychain 操作中…" } else { "保存密钥" }).on_click(cx.listener(|this, _, _, cx| this.store_panel_key(false, cx))))
-                .child(button("ai-key-delete", "明确删除密钥").on_click(cx.listener(|this, _, window, cx| {
+            .child(protocols).child(field(t!(Tr::CpFieldEndpoint), &p.url)).child(field(t!(Tr::CpFieldModelShort), &p.model)).child(field(t!(Tr::CpFieldApiKey), &p.key))
+            .child(row().child(button("ai-save", t!(Tr::CpSaveAiConfig)).on_click(cx.listener(|this, _, _, cx| this.save_panel_ai(cx))))
+                .child(button("ai-key-save", if p.key_busy { t!(Tr::CpKeychainBusy) } else { t!(Tr::CpSaveKey) }).on_click(cx.listener(|this, _, _, cx| this.store_panel_key(false, cx))))
+                .child(button("ai-key-delete", t!(Tr::CpDeleteKey)).on_click(cx.listener(|this, _, window, cx| {
                     this.confirm_panel_key_delete(window, cx);
                 })))
-                .child(button("ai-test", if p.test_busy { "连接测试中…" } else { "测试连接" }).on_click(cx.listener(|this, _, window, cx| {
+                .child(button("ai-test", if p.test_busy { t!(Tr::CpTesting) } else { t!(Tr::CpTestConnection) }).on_click(cx.listener(|this, _, window, cx| {
                     this.test_panel_connection(window, cx);
                 }))))
-            .child(row().child(button("ai-enable", if settings.agent.enabled { "AI 已启用（点击关闭）" } else { "知情同意并启用 AI" }).on_click(cx.listener(|this, _, window, cx| {
+            .child(row().child(button("ai-enable", if settings.agent.enabled { t!(Tr::CpAiEnabled) } else { t!(Tr::CpAiConsent) }).on_click(cx.listener(|this, _, window, cx| {
                 let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; next.agent.enabled = !next.agent.enabled;
-                if next.agent.enabled { let detail = format!("磁盘元数据会发送到 {}，模型 {}。不发送文件内容；每次请求仍需确认。", next.agent.base_url, next.agent.model); this.confirm_panel_settings(next, "同意向指定 AI 服务发送元数据？", &detail, window, cx); }
+                if next.agent.enabled { let detail = tf!(Tr::CpAiEnabledExplain, "target" => next.agent.base_url, "model" => next.agent.model); this.confirm_panel_settings(next, t!(Tr::CpConsentSendMetadata), &detail, window, cx); }
                 else { this.save_panel_settings(next, cx); }
-            }))).child(button("ai-paths", if settings.agent.share_paths { "完整路径：开启" } else { "完整路径：关闭（opaque）" }).on_click(cx.listener(|this, _, window, cx| {
+            }))).child(button("ai-paths", if settings.agent.share_paths { t!(Tr::CpPathsOn) } else { t!(Tr::CpPathsOff) }).on_click(cx.listener(|this, _, window, cx| {
                 let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; next.agent.share_paths = !next.agent.share_paths;
-                if next.agent.share_paths { this.confirm_panel_settings(next, "允许发送完整路径？", "完整路径可能包含用户名、项目名、私人信息；将发送到指定 endpoint。默认 opaque 更安全。", window, cx); }
+                if next.agent.share_paths { this.confirm_panel_settings(next, t!(Tr::CpAllowFullPaths), t!(Tr::CpFullPathsExplain), window, cx); }
                 else { this.save_panel_settings(next, cx); }
-            }))).child(button("ai-thinking", if settings.agent.thinking { "深度思考：开启（发送 thinking/reasoning）" } else { "深度思考：关闭" }).on_click(cx.listener(|this, _, _, cx| {
+            }))).child(button("ai-thinking", if settings.agent.thinking { t!(Tr::CpThinkingOn) } else { t!(Tr::CpThinkingOff) }).on_click(cx.listener(|this, _, _, cx| {
                 let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; next.agent.thinking = !next.agent.thinking;
                 this.save_panel_settings(next, cx);
             }))))
-            .child(row().child(button("ai-analyze", "分析当前磁盘").on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::Analyze, None, window, cx))))
-                .child(button("ai-explain", "解释当前选中项").on_click(cx.listener(|this, _, window, cx| {
+            .child(row().child(button("ai-analyze", t!(Tr::CpAnalyzeDisk)).on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::Analyze, None, window, cx))))
+                .child(button("ai-explain", t!(Tr::CpExplainSelection)).on_click(cx.listener(|this, _, window, cx| {
                     if let Screen::Results(r) = &this.screen { let ix = r.focus; this.explain_cleanup_node(ix, window, cx); }
-                }))).child(button("ai-drafts", "生成规则草案").on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::GenerateRules, None, window, cx))))
-                .child(button("ai-cancel", if p.ai_busy { "取消（丢弃结果）" } else { "清空 AI 建议" }).on_click(cx.listener(|this, _, window, cx| {
+                }))).child(button("ai-drafts", t!(Tr::CpGenerateDrafts)).on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::GenerateRules, None, window, cx))))
+                .child(button("ai-cancel", if p.ai_busy { t!(Tr::CpCancelDiscard) } else { t!(Tr::CpClearSuggestions) }).on_click(cx.listener(|this, _, window, cx| {
                     window.focus(&this.focus_handle, cx);
                     this.cleanup_panel.ai_sequence = this.cleanup_panel.ai_sequence.wrapping_add(1); this.cleanup_panel.ai_busy = false; this.cleanup_panel.response = None;
-                    this.panel_message("结果已取消；已发出的网络请求不能撤回。", cx);
+                    this.panel_message(t!(Tr::CpResultCancelled), cx);
                 }))));
         if let Some((token, response)) = &p.response {
             if self.cleanup_current(*token) {
@@ -1845,12 +1846,12 @@ impl Petal {
                     let adopt = rule.id.clone();
                     let enable = rule.id.clone();
                     let reject = rule.id.clone();
-                    view = view.child(panel_card().child(format!("草案：{} · {} · 保留 {} 天", rule.name, category_label(rule.category), rule.older_than_days.map(|d| d.to_string()).unwrap_or_else(|| "不限（高风险）".into())))
-                        .child(format!("{} / {}\n{}\n风险：缓存可能需要重建；草案默认停用，采用时自动关闭、仅回收站，必须预览后清理。", path_list(&rule.roots), rule.pattern, rule.description))
-                        .child(row().child(button(("draft-adopt", i), "采用（保持停用）").on_click(cx.listener(move |this, _, window, cx| { window.focus(&this.focus_handle, cx); this.adopt_panel_draft(adopt.clone(), false, cx); })))
-                            .child(button(("draft-enable", i), "采用并启用").on_click(cx.listener(move |this, _, window, cx| { window.focus(&this.focus_handle, cx); this.adopt_panel_draft(enable.clone(), true, cx); })))
-                            .child(button(("draft-edit", i), "编辑为用户规则").on_click(cx.listener(move |this, _, window, cx| this.edit_panel_rule(edit.clone(), Some(edit_id.clone()), window, cx))))
-                            .child(button(("draft-reject", i), "拒绝").on_click(cx.listener(move |this, _, window, cx| {
+                    view = view.child(panel_card().child(tf!(Tr::CpDraftMeta, "name" => rule.name, "category" => category_label(rule.category), "days" => rule.older_than_days.map(|d| d.to_string()).unwrap_or_else(|| t!(Tr::CpDraftNoLimit).into())))
+                        .child(tf!(Tr::CpDraftExplain, "roots" => path_list(&rule.roots), "pattern" => rule.pattern, "blurb" => rule.description))
+                        .child(row().child(button(("draft-adopt", i), t!(Tr::CpAdoptDisabled)).on_click(cx.listener(move |this, _, window, cx| { window.focus(&this.focus_handle, cx); this.adopt_panel_draft(adopt.clone(), false, cx); })))
+                            .child(button(("draft-enable", i), t!(Tr::CpAdoptEnable)).on_click(cx.listener(move |this, _, window, cx| { window.focus(&this.focus_handle, cx); this.adopt_panel_draft(enable.clone(), true, cx); })))
+                            .child(button(("draft-edit", i), t!(Tr::CpEditAsUserRule)).on_click(cx.listener(move |this, _, window, cx| this.edit_panel_rule(edit.clone(), Some(edit_id.clone()), window, cx))))
+                            .child(button(("draft-reject", i), t!(Tr::CpReject)).on_click(cx.listener(move |this, _, window, cx| {
                                 window.focus(&this.focus_handle, cx);
                                 if let Some((_, response)) = &mut this.cleanup_panel.response { response.proposals.retain(|r| r.id != reject); } cx.notify();
                             })))));
@@ -1864,29 +1865,40 @@ impl Petal {
         let Ok(settings) = &p.settings else {
             return panel_card();
         };
-        let mut view = panel_card().child("自动清理仅在本应用运行且扫描结果可用时检查，每 60 秒检查一次；启动或更新配置后至少等待配置间隔。每轮最多 200 个文件，且需全局与单规则双授权。")
-            .child(field("自动清理间隔（分钟）", &p.interval))
-            .child(row().child(button("save-interval", "保存间隔").on_click(cx.listener(|this, _, _, cx| {
+        let mut languages = row();
+        for (i, lang) in crate::i18n::Lang::all().into_iter().enumerate() {
+            languages = languages.child(
+                button(("panel-lang", i), lang.label())
+                    .when(crate::i18n::lang() == lang, |d| d.bg(rgb(ACCENT)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_panel_language(lang, cx))),
+            );
+        }
+        let mut view = panel_card()
+            .child(row().child(t!(Tr::CpLanguage)).child(languages))
+            .child(div().text_color(rgb(MUTED)).child(t!(Tr::CpLanguageTip)))
+            .child(t!(Tr::CpAutoIntro))
+            .child(field(t!(Tr::CpAutoInterval), &p.interval))
+            .child(row().child(button("save-interval", t!(Tr::CpSaveInterval)).on_click(cx.listener(|this, _, _, cx| {
                 let Ok(mut next) = this.cleanup_panel.settings.clone() else { return };
-                match text(&this.cleanup_panel.interval, cx).parse() { Ok(minutes) => { next.automation_interval_minutes = minutes; this.save_panel_settings(next, cx); }, Err(_) => this.panel_message("间隔必须是 1–10080 分钟的整数。", cx) }
-            }))).child(button("global-auto", if settings.automation_enabled { "全局自动：开启（点击关闭）" } else { "全局自动：关闭（点击授权）" }).on_click(cx.listener(|this, _, window, cx| {
+                match text(&this.cleanup_panel.interval, cx).parse() { Ok(minutes) => { next.automation_interval_minutes = minutes; this.save_panel_settings(next, cx); }, Err(_) => this.panel_message(t!(Tr::CpBadInterval), cx) }
+            }))).child(button("global-auto", if settings.automation_enabled { t!(Tr::CpGlobalAutoOn) } else { t!(Tr::CpGlobalAutoOff) }).on_click(cx.listener(|this, _, window, cx| {
                 let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; next.automation_enabled = !next.automation_enabled;
-                if next.automation_enabled { this.confirm_panel_settings(next, "授权应用运行期间自动清理？", "仅已逐条授权且符合本地白名单的规则，至少保留 7 天，仅移到回收站。不会立即清理，将等待配置间隔；每轮最多 200 个文件，不安装系统后台任务。", window, cx); }
+                if next.automation_enabled { this.confirm_panel_settings(next, t!(Tr::CpConfirmGlobalAuto), t!(Tr::CpGlobalAutoExplain), window, cx); }
                 else { this.disable_panel_automation(cx); }
-            }))).child(button("default-action", format!("新用户规则默认：{}", action_label(settings.default_action))).on_click(cx.listener(|this, _, _, cx| {
+            }))).child(button("default-action", tf!(Tr::CpDefaultAction, "action" => action_label(settings.default_action))).on_click(cx.listener(|this, _, _, cx| {
                 let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; next.default_action = if next.default_action == CleanupAction::Trash { CleanupAction::Permanent } else { CleanupAction::Trash }; this.save_panel_settings(next, cx);
             }))))
-            .child(field("保护白名单（路径及其子项不会清理）", &p.whitelist))
-            .child(button("add-whitelist", "添加保护路径").on_click(cx.listener(|this, _, _, cx| {
+            .child(field(t!(Tr::CpWhitelistLabel), &p.whitelist))
+            .child(button("add-whitelist", t!(Tr::CpAddWhitelist)).on_click(cx.listener(|this, _, _, cx| {
                 let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; let entries = paths(&text(&this.cleanup_panel.whitelist, cx));
-                if entries.is_empty() { this.panel_message("请输入至少一个具体路径。", cx); return; }
+                if entries.is_empty() { this.panel_message(t!(Tr::CpNeedConcretePath), cx); return; }
                 for entry in entries { if !next.whitelist.contains(&entry) { next.whitelist.push(entry); } }
                 if this.save_panel_settings(next, cx) { this.cleanup_panel.whitelist.update(cx, |input, cx| input.set_text("", cx)); }
             })));
         for (i, path) in settings.whitelist.iter().enumerate() {
             let path = path.clone();
             view = view.child(row().child(path.display().to_string()).child(
-                button(("remove-whitelist", i), "移除保护").on_click(cx.listener(
+                button(("remove-whitelist", i), t!(Tr::CpRemoveProtection)).on_click(cx.listener(
                     move |this, _, window, cx| {
                         let Ok(mut next) = this.cleanup_panel.settings.clone() else {
                             return;
@@ -1894,7 +1906,7 @@ impl Petal {
                         next.whitelist.retain(|p| p != &path);
                         this.confirm_panel_settings(
                             next,
-                            "移除此路径的清理保护？",
+                            t!(Tr::CpConfirmRemoveProtection),
                             &path.display().to_string(),
                             window,
                             cx,
@@ -1903,24 +1915,24 @@ impl Petal {
                 )),
             ));
         }
-        view = view.child(row().child(button("reload-settings", "重载配置").on_click(cx.listener(|this, _, window, cx| { window.focus(&this.focus_handle, cx); this.reload_panel_settings(cx); })))
-            .child(button("load-history", if p.history_busy { "读取记录中…" } else { "加载最近记录" }).on_click(cx.listener(|this, _, _, cx| this.load_panel_history(cx)))))
-            .child("回收站保留原文件名。Finder『放回』可能先恢复到安全隔离暂存目录，再需按记录的原路径手动移回；若没有『放回』，请从回收站取出原名文件并手动移回。成功记录的恢复路径用于定位暂存；失败暂存也仅供检查，本应用不会自动恢复。");
+        view = view.child(row().child(button("reload-settings", t!(Tr::CpReloadConfig)).on_click(cx.listener(|this, _, window, cx| { window.focus(&this.focus_handle, cx); this.reload_panel_settings(cx); })))
+            .child(button("load-history", if p.history_busy { t!(Tr::CpLoadingHistory) } else { t!(Tr::CpLoadHistory) }).on_click(cx.listener(|this, _, _, cx| this.load_panel_history(cx)))))
+            .child(t!(Tr::CpHistoryIntro));
         for (i, entry) in p.history.iter().enumerate() {
             let original = entry.path.display().to_string();
             let copy = original.clone();
             let mut record = panel_card()
-                .child(format!(
-                    "{} · {} · 时间 {}（Unix 秒） · {}",
-                    entry.status,
-                    action_label(entry.action),
-                    entry.time,
-                    if entry.automatic { "自动" } else { "手动" }
+                .child(tf!(
+                    Tr::CpHistoryRow,
+                    "status" => entry.status,
+                    "action" => action_label(entry.action),
+                    "time" => entry.time,
+                    "mode" => if entry.automatic { t!(Tr::CpHistoryAuto) } else { t!(Tr::CpHistoryManual) }
                 ))
                 .child(original)
                 .child(entry.detail.clone().unwrap_or_default())
                 .child(
-                    button(("copy-original", i), "复制原路径").on_click(cx.listener(
+                    button(("copy-original", i), t!(Tr::CpCopyOriginalPath)).on_click(cx.listener(
                         move |_, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
                         },
@@ -1928,8 +1940,8 @@ impl Petal {
                 );
             if let Some(recovery) = &entry.recovery_path {
                 let copy = recovery.display().to_string();
-                record = record.child(format!("暂存/恢复参考路径：{copy}")).child(
-                    button(("copy-recovery", i), "复制暂存路径").on_click(cx.listener(
+                record = record.child(tf!(Tr::CpRestoreReference, "copy" => copy)).child(
+                    button(("copy-recovery", i), t!(Tr::CpCopyStashPath)).on_click(cx.listener(
                         move |_, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
                         },

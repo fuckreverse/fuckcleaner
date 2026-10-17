@@ -14,7 +14,9 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use crate::i18n::Tr;
 use crate::scan::{self, FoldersRead, Fresh, Kind, Raw, Stale, Unreadable};
+use crate::{t, tf};
 
 /// Something to do as an administrator.
 pub enum Job {
@@ -40,7 +42,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Cancelled => write!(f, "cancelled"),
+            Error::Cancelled => write!(f, "{}", t!(Tr::AdCancelled)),
             Error::Failed(why) => write!(f, "{why}"),
         }
     }
@@ -119,9 +121,9 @@ impl Drop for JobFile {
 fn read_reply(pipe: fs::File) -> Result<Outcome, Error> {
     let mut input = In(BufReader::with_capacity(1 << 20, pipe));
     let mut magic = [0u8; 4];
-    input.0.read_exact(&mut magic).map_err(|_| Error::Failed("the administrator helper didn't start".into()))?;
+    input.0.read_exact(&mut magic).map_err(|_| Error::Failed(t!(Tr::AdHelperNoStart).into()))?;
     if &magic != REPLY_MAGIC {
-        return Err(Error::Failed("the administrator helper sent something unexpected".into()));
+        return Err(Error::Failed(t!(Tr::AdHelperUnexpected).into()));
     }
     let pid = input.u64()? as libc::pid_t;
     let parent = input.u64()? as libc::pid_t;
@@ -163,12 +165,12 @@ fn decode_reply<R: Read>(input: &mut In<R>) -> Result<Outcome, Error> {
             }
             Outcome::Deleted { failed }
         }
-        _ => return Err(Error::Failed("the administrator helper sent something unexpected".into())),
+        _ => return Err(Error::Failed(t!(Tr::AdHelperUnexpected).into())),
     };
     let mut end = [0u8; 4];
-    input.0.read_exact(&mut end).map_err(|_| Error::Failed("the administrator helper stopped early".into()))?;
+    input.0.read_exact(&mut end).map_err(|_| Error::Failed(t!(Tr::AdHelperStoppedEarly).into()))?;
     if &end != END {
-        return Err(Error::Failed("the administrator helper stopped early".into()));
+        return Err(Error::Failed(t!(Tr::AdHelperStoppedEarly).into()));
     }
     Ok(outcome)
 }
@@ -191,7 +193,7 @@ pub fn helper_main(job_file: &Path) -> i32 {
             Ok(job) => do_job(&mut out, job)?,
             Err(error) => {
                 out.u8(0)?;
-                out.str(&format!("couldn't read the job: {error}"))?;
+                out.str(&tf!(Tr::AdJobReadFailed, "error" => error))?;
             }
         }
         out.0.write_all(END)?;
@@ -205,7 +207,7 @@ fn read_job(path: &Path) -> io::Result<Job> {
     let mut magic = [0u8; 4];
     input.0.read_exact(&mut magic)?;
     if &magic != JOB_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a Petal job"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, t!(Tr::AdNotAPetalJob)));
     }
     decode_job(&mut input)
 }
@@ -268,11 +270,11 @@ fn delete_snapshot(device: &str, name: &str) -> Result<(), String> {
         whole && !slices.is_empty() && slices.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
     });
     if !is_volume {
-        return Err(format!("“{device}” isn't a volume"));
+        return Err(tf!(Tr::AdNotAVolume, "device" => device));
     }
     let snapshot = crate::disk::Snapshot { name: name.to_string(), created: 0 };
     if !snapshot.is_time_machine() || name.contains('/') {
-        return Err("only Time Machine snapshots are deleted".into());
+        return Err(t!(Tr::AdTmOnly).into());
     }
     let output = std::process::Command::new("/usr/sbin/diskutil")
         .args(["apfs", "deleteSnapshot", device, "-name", name])
@@ -284,7 +286,7 @@ fn delete_snapshot(device: &str, name: &str) -> Result<(), String> {
     } else {
         let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let text = if text.is_empty() { String::from_utf8_lossy(&output.stdout).trim().to_string() } else { text };
-        Err(text.lines().last().unwrap_or("diskutil failed").to_string())
+        Err(text.lines().last().unwrap_or(t!(Tr::AdDiskutilFailed)).to_string())
     }
 }
 
@@ -348,7 +350,7 @@ impl Authorization {
         match status {
             0 => Ok(Authorization(authorization)),
             ERR_AUTHORIZATION_CANCELED => Err(Error::Cancelled),
-            status => Err(Error::Failed(format!("macOS didn't grant administrator rights (error {status})"))),
+            status => Err(Error::Failed(tf!(Tr::AdNotGranted, "status" => status))),
         }
     }
 
@@ -371,7 +373,7 @@ impl Authorization {
                 Ok(unsafe { <fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) })
             }
             ERR_AUTHORIZATION_CANCELED => Err(Error::Cancelled),
-            status => Err(Error::Failed(format!("couldn't start the administrator helper (error {status})"))),
+            status => Err(Error::Failed(tf!(Tr::AdHelperStartFailed, "status" => status))),
         }
     }
 }
@@ -424,20 +426,20 @@ impl<R: Read> In<R> {
     }
     fn count(&mut self) -> io::Result<usize> {
         let count = self.u64()?;
-        usize::try_from(count).ok().filter(|&c| c <= u32::MAX as usize).ok_or_else(|| invalid("count out of range"))
+        usize::try_from(count).ok().filter(|&c| c <= u32::MAX as usize).ok_or_else(|| invalid(t!(Tr::AdCountOutOfRange)))
     }
     fn bytes(&mut self) -> io::Result<Vec<u8>> {
         let length = self.u64()?;
         // Names and paths; nothing near this long is real.
         if length > 1 << 20 {
-            return Err(invalid("string too long"));
+            return Err(invalid(t!(Tr::AdStringTooLong)));
         }
         let mut buf = vec![0u8; length as usize];
         self.0.read_exact(&mut buf)?;
         Ok(buf)
     }
     fn string(&mut self) -> io::Result<String> {
-        String::from_utf8(self.bytes()?).map_err(|_| invalid("not UTF-8"))
+        String::from_utf8(self.bytes()?).map_err(|_| invalid(t!(Tr::AdNotUtf8)))
     }
     fn path(&mut self) -> io::Result<PathBuf> {
         Ok(PathBuf::from(OsStr::from_bytes(&self.bytes()?)))
@@ -510,7 +512,7 @@ fn decode_job<R: Read>(input: &mut In<R>) -> io::Result<Job> {
             }
             Ok(Job::DeleteSnapshots { device, names })
         }
-        _ => Err(invalid("unknown job")),
+        _ => Err(invalid(t!(Tr::AdUnknownJob))),
     }
 }
 
@@ -527,7 +529,7 @@ fn decode_kind(byte: u8) -> io::Result<Kind> {
         0 => Ok(Kind::Dir),
         1 => Ok(Kind::File),
         2 => Ok(Kind::Other),
-        _ => Err(invalid("unknown kind")),
+        _ => Err(invalid(t!(Tr::AdUnknownKind))),
     }
 }
 
@@ -608,7 +610,7 @@ fn decode_fresh<R: Read>(input: &mut In<R>) -> io::Result<Fresh> {
             }
             Ok(Fresh::Listed { own, files, known_dirs, new_dirs })
         }
-        _ => Err(invalid("unknown result")),
+        _ => Err(invalid(t!(Tr::AdUnknownResult))),
     }
 }
 

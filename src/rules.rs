@@ -1386,6 +1386,7 @@ pub(crate) mod fixtures {
                 automation_enabled: false,
                 automation_interval_minutes: 60,
                 agent: crate::agent::AgentConfig::default(),
+                language: None,
             }
         }
         pub fn tree(&self, path: &Path) -> Tree {

@@ -33,6 +33,10 @@ pub const CATEGORIES: [Category; 9] = [
 const K: usize = CATEGORIES.len();
 
 impl Category {
+    /// English name. For UI text use `i18n`-translated labels (see `app.rs`
+    /// `category_label`); this file is shared verbatim with
+    /// `tools/path-classifier`, which has no crate context to translate in.
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Category::Apps => "Apps",

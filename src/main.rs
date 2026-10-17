@@ -10,6 +10,7 @@ mod dirlist;
 mod disk;
 mod eta;
 mod findings;
+mod i18n;
 mod icons;
 mod json;
 mod live;
@@ -35,6 +36,7 @@ use gpui::{
 };
 
 use app::{ChartType, GoUp, OpenFolder, Petal, ReadAsAdmin, Rescan, ShowIcicle, ShowSunburst, ShowTreemap, StartOver};
+use i18n::Tr;
 
 actions!(petal, [Quit, Hide, HideOthers, ShowAll, Minimize, Zoom, CloseWindow]);
 
@@ -99,6 +101,10 @@ fn main() {
             KeyBinding::new("cmd-2", ShowIcicle, None),
             KeyBinding::new("cmd-3", ShowTreemap, None),
         ]);
+        // Seed the UI language from settings before the menus and window are
+        // built; the fallback follows the system language.
+        let saved_language = crate::settings::Settings::load().ok().and_then(|settings| settings.language);
+        i18n::set_lang(saved_language.unwrap_or_else(i18n::detect_system_lang));
         cx.set_menus(menus(ChartType::Sunburst));
 
         let bounds = Bounds::centered(None, size(px(1240.), px(800.)), cx);
@@ -132,50 +138,51 @@ fn main() {
 }
 
 /// The menu bar, with the chart type in use ticked in the View menu (the app sets them again
-/// when it changes).
+/// when it changes). Titles come from the i18n table, so re-set the menus after a language
+/// switch.
 pub fn menus(chart: ChartType) -> Vec<Menu> {
     vec![
         Menu {
             name: "Petal".into(),
             items: vec![
-                MenuItem::action("Hide Petal", Hide),
-                MenuItem::action("Hide Others", HideOthers),
-                MenuItem::action("Show All", ShowAll),
+                MenuItem::action(t!(Tr::MenuHidePetal), Hide),
+                MenuItem::action(t!(Tr::MenuHideOthers), HideOthers),
+                MenuItem::action(t!(Tr::MenuShowAll), ShowAll),
                 MenuItem::separator(),
-                MenuItem::action("Quit Petal", Quit),
+                MenuItem::action(t!(Tr::MenuQuit), Quit),
             ],
             disabled: false,
         },
         Menu {
-            name: "File".into(),
+            name: t!(Tr::MenuFile).to_string().into(),
             items: vec![
-                MenuItem::action("Open Folder…", OpenFolder),
-                MenuItem::action("Rescan", Rescan),
-                MenuItem::action("Read Protected Folders as Administrator…", ReadAsAdmin),
+                MenuItem::action(t!(Tr::MenuOpenFolder), OpenFolder),
+                MenuItem::action(t!(Tr::MenuRescan), Rescan),
+                MenuItem::action(t!(Tr::MenuReadAsAdmin), ReadAsAdmin),
                 MenuItem::separator(),
-                MenuItem::action("Show Disks", StartOver),
+                MenuItem::action(t!(Tr::MenuShowDisks), StartOver),
                 MenuItem::separator(),
-                MenuItem::action("Close Window", CloseWindow),
+                MenuItem::action(t!(Tr::MenuCloseWindow), CloseWindow),
             ],
             disabled: false,
         },
         Menu {
-            name: "View".into(),
+            name: t!(Tr::MenuView).to_string().into(),
             items: vec![
-                MenuItem::action("as Sunburst", ShowSunburst).checked(chart == ChartType::Sunburst),
-                MenuItem::action("as Icicle", ShowIcicle).checked(chart == ChartType::Icicle),
-                MenuItem::action("as Treemap", ShowTreemap).checked(chart == ChartType::Treemap),
+                MenuItem::action(t!(Tr::MenuAsSunburst), ShowSunburst).checked(chart == ChartType::Sunburst),
+                MenuItem::action(t!(Tr::MenuAsIcicle), ShowIcicle).checked(chart == ChartType::Icicle),
+                MenuItem::action(t!(Tr::MenuAsTreemap), ShowTreemap).checked(chart == ChartType::Treemap),
             ],
             disabled: false,
         },
         Menu {
-            name: "Go".into(),
-            items: vec![MenuItem::action("Enclosing Folder", GoUp)],
+            name: t!(Tr::MenuGo).to_string().into(),
+            items: vec![MenuItem::action(t!(Tr::MenuEnclosingFolder), GoUp)],
             disabled: false,
         },
         Menu {
-            name: "Window".into(),
-            items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)],
+            name: t!(Tr::MenuWindow).to_string().into(),
+            items: vec![MenuItem::action(t!(Tr::MenuMinimize), Minimize), MenuItem::action(t!(Tr::MenuZoom), Zoom)],
             disabled: false,
         },
     ]

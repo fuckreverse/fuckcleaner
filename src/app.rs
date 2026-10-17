@@ -21,6 +21,8 @@ use crate::classify::{self, CATEGORIES, Category};
 use crate::clock;
 use crate::disk;
 use crate::eta;
+use crate::i18n::Tr;
+use crate::{t, tf};
 use crate::onboarding;
 use crate::findings::{self, Finding, Fix};
 use crate::safety;
@@ -405,8 +407,14 @@ enum AdminRead {
 }
 
 /// The password dialog's message when reading as an administrator.
-const ADMIN_READ_PROMPT: &str = "Petal wants to read the folders that belong to macOS and other users, to include their sizes. It only reads names and sizes; nothing is changed.";
-const DELETE_SNAPSHOTS_PROMPT: &str = "Petal wants to delete Time Machine’s local snapshots to free the space they hold.";
+// Prompts for the privileged helper's password dialog, localized at call time
+// (see `admin::run`); kept as functions so a language switch is picked up.
+fn admin_read_prompt() -> &'static str {
+    t!(Tr::AdminReadPrompt)
+}
+fn delete_snapshots_prompt() -> &'static str {
+    t!(Tr::DeleteSnapshotsPrompt)
+}
 
 struct Trashed {
     /// The item's name, or how many there were.
@@ -820,32 +828,29 @@ impl Petal {
         let (title, body) = match self.access {
             Access::Granted | Access::Dismissed => return None,
             Access::Missing => (
-                "See everything on your disk",
+                t!(Tr::AccessTitleMissing),
                 match not_readable {
-                    Some(bytes) => format!(
-                        "{} couldn't be read. macOS keeps some folders private (Mail, Messages, Safari, other apps' data) unless Petal has Full Disk Access.",
-                        format_size(bytes)
-                    ),
-                    None => "macOS keeps some folders private (Mail, Messages, Safari, other apps' data). Give Petal Full Disk Access so the scan can include them.".to_string(),
+                    Some(bytes) => tf!(Tr::AccessBodyWithBytes, "size" => format_size(bytes)),
+                    None => t!(Tr::AccessBodyPlain).to_string(),
                 },
             ),
-            Access::JustGranted => ("Full Disk Access is on", "Rescan to include the folders that were private before.".to_string()),
+            Access::JustGranted => (t!(Tr::AccessTitleGranted), t!(Tr::AccessBodyGranted).to_string()),
         };
         let actions = div().flex().gap_2().justify_end().mt_1();
         let actions = match self.access {
             Access::JustGranted => actions.child(
-                primary_button("access-rescan", "Rescan", ACCENT).on_click(cx.listener(|this, _, window, cx| {
+                primary_button("access-rescan", t!(Tr::Rescan), ACCENT).on_click(cx.listener(|this, _, window, cx| {
                     this.access = Access::Granted;
                     this.rescan(&Rescan, window, cx);
                 })),
             ),
             _ => actions
-                .child(button("access-later", "Not now").on_click(cx.listener(|this, _, _, cx| {
+                .child(button("access-later", t!(Tr::NotNow)).on_click(cx.listener(|this, _, _, cx| {
                     this.access = Access::Dismissed;
                     cx.notify();
                 })))
                 .child(
-                    primary_button("access-open", "Open Privacy Settings", ACCENT)
+                    primary_button("access-open", t!(Tr::OpenPrivacySettings), ACCENT)
                         .on_click(cx.listener(|_, _, _, cx| cx.open_url(onboarding::FULL_DISK_ACCESS_SETTINGS))),
                 ),
         };
@@ -864,7 +869,7 @@ impl Petal {
                 .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                 .child(div().text_xs().text_color(rgb(MUTED)).child(body))
                 .when(self.access == Access::Missing, |d| {
-                    d.child(div().text_xs().text_color(rgb(MUTED)).child("In Settings, turn on Petal (use + to add it if it isn't listed)."))
+                    d.child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::AccessHowTo)))
                 })
                 .child(actions),
         )
@@ -1161,7 +1166,7 @@ impl Petal {
             })
             .collect();
         if stale.is_empty() {
-            self.show_notice("Petal could already read every folder here.".into(), cx);
+            self.show_notice(t!(Tr::AlreadyReadable).into(), cx);
             return;
         }
         let job = admin::Job::Read { root: tree.root_path.clone(), stale, hardlinks: tree.hardlinks.clone() };
@@ -1171,7 +1176,7 @@ impl Petal {
         cx.spawn(async move |this, cx| {
             let (result, volumes) = cx
                 .background_spawn(async move {
-                    let result = admin::run(&job, ADMIN_READ_PROMPT);
+                    let result = admin::run(&job, admin_read_prompt());
                     let volumes = if startup && result.is_ok() { scan::startup_volumes() } else { None };
                     (result, volumes)
                 })
@@ -1204,7 +1209,7 @@ impl Petal {
             }
             Err(admin::Error::Failed(why)) => {
                 r.admin = AdminRead::Offered;
-                self.show_warning(format!("Couldn’t read as administrator: {why}"), cx);
+                self.show_warning(tf!(Tr::ReadAdminFail, "why" => why), cx);
                 return;
             }
         };
@@ -1234,11 +1239,14 @@ impl Petal {
         let Some(r) = self.results() else { return };
         let found = scanned_size(&r.tree).saturating_sub(read_before);
         let notice = match still {
-            0 => format!("Read every protected folder: {} more accounted for.", format_size(found)),
-            n => format!(
-                "Read the protected folders: {} more accounted for. macOS keeps {} even from administrators.",
-                format_size(found),
-                if n == 1 { "1 folder".to_string() } else { format!("{} folders", format_count(n as u64)) }
+            0 => tf!(Tr::AdminFoundMore, "more" => format_size(found)),
+            n => tf!(
+                Tr::AdminFoundSome,
+                "more" => format_size(found),
+                "folders" => match n {
+                    1 => t!(Tr::OneFolder).to_string(),
+                    _ => tf!(Tr::NFolders, "n" => format_count(n as u64)),
+                }
             ),
         };
         self.show_notice(notice, cx);
@@ -1258,14 +1266,14 @@ impl Petal {
             return;
         }
         let message = match names.len() {
-            1 => "Delete the Time Machine snapshot?".to_string(),
-            n => format!("Delete {n} Time Machine snapshots?"),
+            1 => t!(Tr::DeleteOneSnapshot).to_string(),
+            n => tf!(Tr::DeleteSnapshots, "n" => n),
         };
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
-            Some("Time Machine keeps local snapshots for a day so you can restore recent changes. Deleting them frees the space they hold; your Time Machine backups aren’t affected. macOS asks for an administrator’s password."),
-            &["Delete Snapshots", "Cancel"],
+            Some(t!(Tr::SnapshotsExplain)),
+            &[t!(Tr::DeleteSnapshotsButton), t!(Tr::Cancel)],
             cx,
         );
         let id = r.id;
@@ -1287,7 +1295,7 @@ impl Petal {
                 .background_spawn(async move {
                     let layout = disk::startup_layout(scan::startup_disk_name()).ok_or_else(|| admin::Error::Failed("the startup disk isn’t APFS".into()))?;
                     let job = admin::Job::DeleteSnapshots { device: layout.data_device, names };
-                    let outcome = admin::run(&job, DELETE_SNAPSHOTS_PROMPT);
+                    let outcome = admin::run(&job, delete_snapshots_prompt());
                     // APFS frees a snapshot's blocks in the background; give it a moment.
                     if outcome.is_ok() {
                         std::thread::sleep(Duration::from_secs(2));
@@ -1309,14 +1317,14 @@ impl Petal {
                         r.relayout();
                         let freed = before.saturating_sub(remainder_size(&r.tree));
                         match failed.first() {
-                            None if freed > 0 => this.show_notice(format!("Deleted the snapshots, freeing {} so far.", format_size(freed)), cx),
-                            None => this.show_notice("Deleted the snapshots. APFS frees their space over the next minute or so.".into(), cx),
-                            Some((_, why)) => this.show_warning(format!("Couldn’t delete {} of the snapshots: {why}", failed.len()), cx),
+                            None if freed > 0 => this.show_notice(tf!(Tr::SnapshotsDeleted, "freed" => format_size(freed)), cx),
+                            None => this.show_notice(t!(Tr::SnapshotsDeletedDeferred).into(), cx),
+                            Some((_, why)) => this.show_warning(tf!(Tr::SnapshotsPartialFail, "n" => failed.len(), "why" => why), cx),
                         }
                         this.refresh_slices_later(id, cx);
                     }
                     Ok(_) | Err(admin::Error::Cancelled) => {}
-                    Err(admin::Error::Failed(why)) => this.show_warning(format!("Couldn’t delete the snapshots: {why}"), cx),
+                    Err(admin::Error::Failed(why)) => this.show_warning(tf!(Tr::SnapshotsFail, "why" => why), cx),
                 }
                 cx.notify();
             })
@@ -1357,18 +1365,18 @@ impl Petal {
             return None;
         }
         let folders = match r.tree.unreadable.len() {
-            1 => "1 folder belongs".to_string(),
-            n => format!("{} folders belong", format_count(n as u64)),
+            1 => t!(Tr::FoldersBelongOne).to_string(),
+            n => tf!(Tr::FoldersBelongMany, "n" => format_count(n as u64)),
         };
         let reading = r.admin == AdminRead::Reading;
         let body = if reading {
-            "Reading as administrator…".to_string()
+            t!(Tr::AdminCardReading).to_string()
         } else {
-            format!("{folders} to macOS or other users. An administrator can read them; Petal only reads names and sizes.")
+            tf!(Tr::AdminCardBody, "folders" => folders)
         };
         Some(
             card()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Read protected folders"))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(t!(Tr::ReadProtectedFolders)))
                 .child(div().text_xs().text_color(rgb(MUTED)).child(body))
                 .when(!reading, |d| {
                     d.child(
@@ -1377,15 +1385,15 @@ impl Petal {
                             .gap_2()
                             .justify_end()
                             .mt_1()
-                            .child(button("admin-later", "Not now").on_click(cx.listener(|this, _, _, cx| {
+                            .child(button("admin-later", t!(Tr::NotNow)).on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(r) = this.results() {
                                     r.admin = AdminRead::Dismissed;
                                 }
                                 cx.notify();
                             })))
                             .child(
-                                primary_button("admin-read", "Read as Administrator…", ACCENT)
-                                    .tooltip(tooltip("macOS asks for an administrator’s password"))
+                                primary_button("admin-read", t!(Tr::ReadAsAdmin), ACCENT)
+                                    .tooltip(tooltip(t!(Tr::AdminPasswordTip)))
                                     .on_click(cx.listener(|this, _, _, cx| this.read_as_admin(cx))),
                             ),
                     )
@@ -1400,8 +1408,8 @@ impl Petal {
             return None;
         }
         let title = match snapshots.len() {
-            1 => "1 APFS snapshot".to_string(),
-            n => format!("{n} APFS snapshots"),
+            1 => t!(Tr::OneApfsSnapshot).to_string(),
+            n => tf!(Tr::NApfsSnapshots, "n" => n),
         };
         let mut kinds: Vec<(&str, usize)> = Vec::new();
         for snapshot in snapshots {
@@ -1410,15 +1418,21 @@ impl Petal {
                 None => kinds.push((snapshot.kind(), 1)),
             }
         }
-        let mut summary = kinds.iter().map(|(kind, count)| format!("{count} {kind}")).collect::<Vec<_>>().join(", ");
+        let kind_label = |kind: &str| match kind {
+            "Time Machine" => t!(Tr::KindTimeMachine),
+            "macOS update" => t!(Tr::KindMacosUpdate),
+            "Carbon Copy Cloner" => "Carbon Copy Cloner",
+            _ => t!(Tr::KindOtherApp),
+        };
+        let mut summary = kinds.iter().map(|(kind, count)| format!("{count} {}", kind_label(kind))).collect::<Vec<_>>().join(", ");
         if let Some(oldest) = snapshots.first() {
-            summary.push_str(&format!(" · oldest {}", format_date(oldest.created)));
+            summary.push_str(&tf!(Tr::OldestSuffix, "date" => format_date(oldest.created)));
         }
         let time_machine = snapshots.iter().filter(|s| s.is_time_machine()).count();
         let explanation = if time_machine > 0 {
-            "Snapshots keep earlier copies of your files, so deleting a file frees nothing while a snapshot still holds it. APFS doesn’t say how much each one holds: it’s part of “Snapshots and unreadable”. Time Machine’s are a day’s quick undo, safe to delete; the rest belong to macOS or other apps, which remove them when they’re done."
+            t!(Tr::SnapshotsExplainTm)
         } else {
-            "Snapshots keep earlier copies of your files, so deleting a file frees nothing while a snapshot still holds it. APFS doesn’t say how much each one holds: it’s part of “Snapshots and unreadable”. These belong to macOS or other apps, which remove them when they’re done."
+            t!(Tr::SnapshotsExplainOther)
         };
         let deleting = r.deleting_snapshots;
         Some(
@@ -1428,7 +1442,7 @@ impl Petal {
                 .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                 .child(div().text_xs().text_color(rgb(MUTED)).child(summary))
                 .when(time_machine > 0, |d| {
-                    let label = if deleting { "Deleting…" } else { "Delete Time Machine Snapshots…" };
+                    let label = if deleting { t!(Tr::Deleting) } else { t!(Tr::DeleteTmSnapshotsButton) };
                     d.child(
                         div().flex().justify_end().mt_1().child(
                             button("snapshots-delete", label)
@@ -1702,23 +1716,23 @@ impl Petal {
         let items = r.collector.clone();
         let paths: Vec<PathBuf> = items.iter().map(|&ix| r.tree.path_of(ix)).collect();
         let message = if items.len() == 1 {
-            format!("Move “{}” to the Trash?", r.tree.nodes[items[0]].name)
+            tf!(Tr::MoveOneToTrash, "name" => r.tree.nodes[items[0]].name)
         } else {
-            format!("Move {} items to the Trash?", items.len())
+            tf!(Tr::MoveManyToTrash, "n" => items.len())
         };
         // Quote what deleting really frees (clones and hard links shared with files outside
         // the selection stay), once it's known.
         let detail = match r.collector_frees.get() {
-            Some(frees) => format!("This will free up {}. You can put items back from the Trash in Finder.", format_size(frees)),
-            None => format!(
-                "This will free up to {} (still working out how much is shared). You can put items back from the Trash in Finder.",
-                format_size(r.collected_size())
+            Some(frees) => tf!(Tr::TrashFreesUp, "freed" => format_size(frees)),
+            None => tf!(
+                Tr::TrashFreesUpTentative,
+                "freed" => format_size(r.collected_size())
             ),
         };
         let what = if items.len() == 1 {
             format!("“{}”", r.tree.nodes[items[0]].name)
         } else {
-            format!("{} items", format_count(items.len() as u64))
+            tf!(Tr::NItemsWord, "n" => format_count(items.len() as u64))
         };
         let frees = r.collector_frees.get().unwrap_or_else(|| r.collected_size());
         let results_id = r.id;
@@ -1727,7 +1741,7 @@ impl Petal {
             PromptLevel::Warning,
             &message,
             Some(&detail),
-            &["Move to Trash", "Cancel"],
+            &[t!(Tr::MoveToTrashButton), t!(Tr::Cancel)],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -1787,7 +1801,7 @@ impl Petal {
                         }
                         cx.play_haptic_feedback(HapticFeedbackStyle::LevelChange);
                     }
-                    Err(error) => this.error = Some(format!("Couldn’t move to Trash: {error}")),
+                    Err(error) => this.error = Some(tf!(Tr::TrashFail, "why" => error)),
                 }
                 cx.notify();
             })
@@ -1884,8 +1898,6 @@ fn card() -> gpui::Div {
 /// Purgeable space below this isn't worth a mention.
 const MIN_PURGEABLE: u64 = 1_000_000;
 
-const PURGEABLE_TOOLTIP: &str = "Space macOS frees by itself when it needs room: Time Machine snapshots, iCloud files it can download again, caches. It’s already counted in the sizes here.";
-
 fn shows_purgeable(tree: &Tree) -> bool {
     tree.purgeable.is_some_and(|p| p >= MIN_PURGEABLE)
 }
@@ -1909,12 +1921,28 @@ fn remainder_size(tree: &Tree) -> u64 {
 
 /// "4 Oct" this year, "4 Oct 2025" otherwise (UTC is near enough for a date).
 fn format_date(seconds: i64) -> String {
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let (this_year, _, _) = civil_from_days(now.div_euclid(86_400));
-    let month = MONTHS[(month - 1) as usize];
+    let month = crate::i18n::month_name((month - 1) as usize);
     if year == this_year { format!("{day} {month}") } else { format!("{day} {month} {year}") }
+}
+
+/// The localized name of a file-kind category. `Category::label` stays English
+/// because that file is shared verbatim with `tools/path-classifier`, which has
+/// no crate context to translate in.
+fn category_label(category: Category) -> &'static str {
+    match category {
+        Category::Apps => t!(Tr::CatApps),
+        Category::Downloads => t!(Tr::CatDownloads),
+        Category::Developer => t!(Tr::CatDeveloper),
+        Category::Caches => t!(Tr::CatCaches),
+        Category::Media => t!(Tr::CatMedia),
+        Category::Documents => t!(Tr::CatDocuments),
+        Category::AppData => t!(Tr::CatAppData),
+        Category::System => t!(Tr::CatSystem),
+        Category::Mixed => t!(Tr::CatMixed),
+    }
 }
 
 /// Days since 1970-01-01 to (year, month, day), after Howard Hinnant's algorithm.
@@ -1998,7 +2026,7 @@ impl Petal {
                 }
             });
 
-        bar = bar.child(button("cleanup-panel", if self.cleanup_panel.open { "规则与 AI · 返回图表" } else { "规则与 AI" })
+        bar = bar.child(button("cleanup-panel", if self.cleanup_panel.open { t!(Tr::RulesAiBack) } else { t!(Tr::RulesAi) })
             .flex_shrink_0()
             .on_click(cx.listener(|this, _, window, cx| {
                 window.focus(&this.focus_handle, cx);
@@ -2006,7 +2034,7 @@ impl Petal {
                 cx.notify();
             })));
         if self.cleanup_panel.open {
-            return bar.child(div().min_w_0().truncate().child("扫描仍在后台继续"));
+            return bar.child(div().min_w_0().truncate().child(t!(Tr::ScanContinuesBehind)));
         }
         match &self.screen {
             Screen::Results(r) => {
@@ -2020,7 +2048,7 @@ impl Petal {
                 bar = bar.child(
                     up.text_base()
                         .px_2()
-                        .tooltip(tooltip("Enclosing Folder (⌘↑)"))
+                        .tooltip(tooltip(t!(Tr::EnclosingFolderTip)))
                         .on_click(cx.listener(|this, _, window, cx| this.go_up(&GoUp, window, cx))),
                 );
                 let chain = r.tree.ancestry(r.focus);
@@ -2059,19 +2087,19 @@ impl Petal {
                     .child(color_toggle(r.color_by, captions, cx))
                     .child(
                         div().text_xs().text_color(rgb(MUTED)).min_w(px(0.)).flex_shrink(1.).truncate().child(if r.out_of_date {
-                            "Out of date · rescan to refresh".to_string()
+                            t!(Tr::OutOfDate).to_string()
                         } else {
-                            format!("Scanned in {:.1}s", r.elapsed.as_secs_f32())
+                            tf!(Tr::ScannedIn, "s" => format!("{:.1}", r.elapsed.as_secs_f32()))
                         }),
                     )
                     .child(
-                        button("rescan", "Rescan")
-                            .tooltip(tooltip("Scan this folder again (⌘R)"))
+                        button("rescan", t!(Tr::Rescan))
+                            .tooltip(tooltip(t!(Tr::RescanTip)))
                             .on_click(cx.listener(|this, _, window, cx| this.rescan(&Rescan, window, cx))),
                     )
                     .child(
-                        button("start-over", "Disks")
-                            .tooltip(tooltip("Back to the list of disks (⇧⌘D)"))
+                        button("start-over", t!(Tr::Disks))
+                            .tooltip(tooltip(t!(Tr::DisksTip)))
                             .on_click(cx.listener(|this, _, window, cx| this.start_over(&StartOver, window, cx))),
                     );
             }
@@ -2115,20 +2143,25 @@ impl Petal {
                                     .flex()
                                     .gap_1()
                                     .text_color(rgb(MUTED))
-                                    .child(format!("{} used · {} free of {}", format_size(used), format_size(volume.free), format_size(volume.total)))
+                                    .child(tf!(
+                                        Tr::UsedFreeOf,
+                                        "used" => format_size(used),
+                                        "free" => format_size(volume.free),
+                                        "total" => format_size(volume.total)
+                                    ))
                                     .when(volume.purgeable.is_some_and(|p| p >= MIN_PURGEABLE), |d| {
                                         d.child("·").child(
                                             div()
                                                 .id(("purgeable", i))
-                                                .tooltip(tooltip(PURGEABLE_TOOLTIP))
-                                                .child(format!("{} purgeable", format_size(volume.purgeable.unwrap_or(0)))),
+                                                .tooltip(tooltip(t!(Tr::PurgeableTooltip)))
+                                                .child(tf!(Tr::PurgeableCount, "size" => format_size(volume.purgeable.unwrap_or(0)))),
                                         )
                                     }),
                             )
                             .child(meter(fraction)),
                     )
                     .child(
-                        primary_button(("scan", i), "Scan", ACCENT)
+                        primary_button(("scan", i), t!(Tr::Scan), ACCENT)
                             .on_click(cx.listener(move |this, _, _, cx| this.start_scan(path.clone(), cx))),
                     ),
             );
@@ -2145,7 +2178,7 @@ impl Petal {
                     .items_center()
                     .gap_1()
                     .child(div().text_3xl().font_weight(FontWeight::BOLD).child("Petal"))
-                    .child(div().text_color(rgb(MUTED)).child("Find out what’s taking up space on your disk.")),
+                    .child(div().text_color(rgb(MUTED)).child(t!(Tr::StartTagline))),
             )
             .child(list)
             .child(
@@ -2154,12 +2187,12 @@ impl Petal {
                     .gap_3()
                     .when_some(home, |el, home| {
                         el.child(
-                            button("scan-home", "Scan Home Folder")
+                            button("scan-home", t!(Tr::ScanHome))
                                 .on_click(cx.listener(move |this, _, _, cx| this.start_scan(home.clone(), cx))),
                         )
                     })
                     .child(
-                        button("choose", "Choose Folder…  ⌘O")
+                        button("choose", t!(Tr::ChooseFolder))
                             .on_click(cx.listener(|this, _, window, cx| this.open_folder(&OpenFolder, window, cx))),
                     ),
             )
@@ -2170,7 +2203,7 @@ impl Petal {
                         .text_xs()
                         .text_color(rgb(MUTED))
                         .text_center()
-                        .child("Tip: grant Full Disk Access in System Settings › Privacy & Security to include protected folders."),
+                        .child(t!(Tr::FdaTip)),
                 )
             });
         centred_scroll("start", page)
@@ -2259,8 +2292,12 @@ impl Petal {
                     .flex()
                     .flex_col()
                     .gap_0p5()
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).truncate().child(format!("Scanning “{disk_name}”…")))
-                    .child(div().text_color(rgb(MUTED)).child(format!("{} · {} files", format_size(scanned), format_count(files))))
+                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).truncate().child(tf!(Tr::ScanningNamed, "name" => disk_name)))
+                      .child(div().text_color(rgb(MUTED)).child(tf!(
+                          Tr::SizeAndFiles,
+                          "size" => format_size(scanned),
+                          "n" => format_count(files)
+                      )))
                     .child(match progress.expected_items.get() {
                         Some(&expected) => {
                             let items = files + progress.dirs.load(Ordering::Relaxed);
@@ -2280,13 +2317,13 @@ impl Petal {
                                         .child(div().h_full().w(relative(done)).rounded_full().bg(rgb(ACCENT))),
                                 )
                                 .child(div().text_xs().text_color(rgb(MUTED)).child(match left {
-                                    Some(left) => format!("{:.0}% · {left}", done * 100.0),
-                                    None => format!("{:.0}%", done * 100.0),
+                                    Some(left) => tf!(Tr::PercentEta, "percent" => format!("{:.0}", done * 100.0), "left" => left),
+                                    None => tf!(Tr::PercentOnly, "percent" => format!("{:.0}", done * 100.0)),
                                 }))
                                 .into_any_element()
                         }
                         // A folder: no known total, so no percentage or countdown.
-                        None => div().text_xs().text_color(rgb(MUTED)).child("Scanning…").into_any_element(),
+                        None => div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::Scanning)).into_any_element(),
                     })
                     .child(
                         div()
@@ -2311,7 +2348,7 @@ impl Petal {
                     .flex()
                     .justify_end()
                     .items_center()
-                    .child(button("cancel", "Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_scan(cx)))),
+                    .child(button("cancel", t!(Tr::Cancel)).on_click(cx.listener(|this, _, _, cx| this.cancel_scan(cx)))),
             );
 
         // Chart: share of the volume found so far for plain volume scans (the startup disk's
@@ -2330,15 +2367,19 @@ impl Petal {
                 Some(layout) => (
                     layout.name.clone(),
                     vec![
-                        format!("{} used", format_size(layout.container_used)),
-                        format!("{} of {} scanned", format_size(scanned), format_size(layout.data_used)),
+                        tf!(Tr::UsedAmount, "size" => format_size(layout.container_used)),
+                        tf!(
+                            Tr::ScannedOf,
+                            "scanned" => format_size(scanned),
+                            "total" => format_size(layout.data_used)
+                        ),
                     ],
                 ),
                 None => (
                     format_size(view.as_ref().map(|v| v.tree.nodes[Tree::ROOT].size).unwrap_or(0).max(scanned)),
                     vec![match scanning.expected {
-                        Some(expected) => format!("of {} used", format_size(expected)),
-                        None => "scanning…".to_string(),
+                        Some(expected) => tf!(Tr::OfUsed, "used" => format_size(expected)),
+                        None => t!(Tr::ScanningLower).to_string(),
                     }],
                 ),
         };
@@ -2430,20 +2471,20 @@ impl Petal {
                     .flex_col()
                     .gap_0p5()
                     .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).truncate().child(focus.name.clone()))
-                    .child(div().text_color(rgb(MUTED)).child(format!(
-                        "{} · {} files",
-                        format_size(focus.size),
-                        format_count(focus.items)
+                    .child(div().text_color(rgb(MUTED)).child(tf!(
+                        Tr::SizeAndFiles,
+                        "size" => format_size(focus.size),
+                        "n" => format_count(focus.items)
                     )))
                     // Counts for the whole scan, so only at its top, in one line; the
                     // tooltips explain them.
                     .when(r.focus == Tree::ROOT && (r.tree.cloud_only > 0 || r.tree.errors > 0 || shows_purgeable(&r.tree)), |d| {
                         let unreadable_reason = if self.access == Access::Missing {
-                            "Private to macOS until Petal has Full Disk Access"
+                            t!(Tr::PrivateUntilFda)
                         } else if r.admin == AdminRead::Done {
-                            "Protected by macOS; not even an administrator can read them"
+                            t!(Tr::SystemProtected)
                         } else {
-                            "Owned by macOS or another user: File › Read Protected Folders as Administrator reads them"
+                            t!(Tr::OtherUsersOwned)
                         };
                         d.child(
                             div()
@@ -2455,8 +2496,8 @@ impl Petal {
                                     d.child(
                                         div()
                                             .id("cloud-only")
-                                            .tooltip(tooltip("In iCloud and not downloaded, so they use no space on this Mac"))
-                                            .child(format!("{} cloud-only", format_count(r.tree.cloud_only))),
+                                            .tooltip(tooltip(t!(Tr::CloudOnlyTip)))
+                                            .child(tf!(Tr::CloudOnlyCount, "n" => format_count(r.tree.cloud_only))),
                                     )
                                 })
                                 .when(r.tree.cloud_only > 0 && r.tree.errors > 0, |d| d.child("·"))
@@ -2465,15 +2506,15 @@ impl Petal {
                                         div()
                                             .id("unreadable")
                                             .tooltip(tooltip(unreadable_reason))
-                                            .child(format!("{} unreadable", format_count(r.tree.errors))),
+                                            .child(tf!(Tr::UnreadableCount, "n" => format_count(r.tree.errors))),
                                     )
                                 })
                                 .when(shows_purgeable(&r.tree), |d| {
                                     d.when(r.tree.cloud_only > 0 || r.tree.errors > 0, |d| d.child("·")).child(
                                         div()
                                             .id("purgeable")
-                                            .tooltip(tooltip(PURGEABLE_TOOLTIP))
-                                            .child(format!("{} purgeable", format_size(r.tree.purgeable.unwrap_or(0)))),
+                                            .tooltip(tooltip(t!(Tr::PurgeableTooltip)))
+                                            .child(tf!(Tr::PurgeableCount, "size" => format_size(r.tree.purgeable.unwrap_or(0)))),
                                     )
                                 }),
                         )
@@ -2547,7 +2588,7 @@ impl Petal {
                             .items_center()
                             .gap_2()
                             .child(div().size(px(8.)).flex_none().rounded_full().bg(rgb(color)))
-                            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(finding.title))
+                            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(finding.title_label()))
                             .child(
                                 div()
                                     .flex_none()
@@ -2560,7 +2601,7 @@ impl Petal {
                             .when(interactive && fix == Fix::GitGc, |d| {
                                 let git_dirs = nodes.clone();
                                 d.child(
-                                    icon_button(("copy-gc", i), "⧉", "Copy git gc Commands")
+                                    icon_button(("copy-gc", i), "⧉", t!(Tr::CopyGcCommands))
                                         .invisible()
                                         .group_hover("finding", |s| s.visible())
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2568,8 +2609,8 @@ impl Petal {
                                             let Some(r) = this.results() else { return };
                                             let paths: Vec<PathBuf> = git_dirs.iter().map(|&ix| r.shown_path(ix)).collect();
                                             let notice = match paths.len() {
-                                                1 => "Copied the git gc command: paste it in Terminal".to_string(),
-                                                n => format!("Copied git gc commands for {n} repositories: paste them in Terminal"),
+                                                1 => t!(Tr::CopiedOneGcCommand).to_string(),
+                                                n => tf!(Tr::CopiedGcCommands, "n" => n),
                                             };
                                             this.copy_to_clipboard(findings::git_gc_commands(&paths), notice, cx);
                                         })),
@@ -2580,18 +2621,18 @@ impl Petal {
                                 _ => None,
                             }, |d, command| {
                                 d.child(
-                                    icon_button(("copy-command", i), "⧉", "Copy Command")
+                                    icon_button(("copy-command", i), "⧉", t!(Tr::CopyCommand))
                                         .invisible()
                                         .group_hover("finding", |s| s.visible())
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            this.copy_to_clipboard(command.to_string(), format!("Copied `{command}`: paste it in Terminal"), cx);
+                                            this.copy_to_clipboard(command.to_string(), tf!(Tr::CopiedPaste, "cmd" => command), cx);
                                         })),
                                 )
                             })
                             .when(interactive && collectable && !in_collector, |d| {
                                 d.child(
-                                    icon_button(("collect-finding", i), "+", "Add to Collector")
+                                    icon_button(("collect-finding", i), "+", t!(Tr::AddToCollector))
                                         .invisible()
                                         .group_hover("finding", |s| s.visible())
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2602,7 +2643,7 @@ impl Petal {
                             })
                             .when(interactive && in_collector, |d| {
                                 d.child(
-                                    icon_button(("uncollect-finding", i), "✓", "Remove from Collector")
+                                    icon_button(("uncollect-finding", i), "✓", t!(Tr::RemoveFromCollector))
                                         .text_color(rgb(ACCENT))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
@@ -2624,9 +2665,9 @@ impl Petal {
                             .child(div().flex_none().text_color(rgb(color)).child(tag))
                             .child(div().flex_none().text_color(rgb(MUTED)).child("·"))
                             .child(if in_collector {
-                                div().min_w_0().text_color(rgb(ACCENT)).truncate().child("In Collector")
+                                div().min_w_0().text_color(rgb(ACCENT)).truncate().child(t!(Tr::InCollector))
                             } else {
-                                div().min_w_0().text_color(rgb(MUTED)).truncate().child(finding.blurb.clone())
+                                div().min_w_0().text_color(rgb(MUTED)).truncate().child(finding.blurb_label())
                             }),
                     ),
             );
@@ -2647,11 +2688,11 @@ impl Petal {
                     .px_2()
                     .flex()
                     .justify_between()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Findings"))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(t!(Tr::Findings)))
                     .child(div().text_xs().text_color(rgb(MUTED)).child(if findings.iter().any(|f| f.pending) {
-                        "working out savings…".to_string()
+                        t!(Tr::WorkingOutSavings).to_string()
                     } else if safe > 0 {
-                        format!("{} safe to delete", format_size(safe))
+                        tf!(Tr::SafeToDelete, "size" => format_size(safe))
                     } else {
                         String::new()
                     })),
@@ -2724,28 +2765,28 @@ impl Petal {
                             ),
                     )
                     .when(is_hovered && node.kind != Kind::Other, |d| {
-                        d.child(button(("ai-explain-row", ix), "解释").text_xs()
+                        d.child(button(("ai-explain-row", ix), t!(Tr::ExplainRow)).text_xs()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.explain_cleanup_node(ix, window, cx);
                             })))
                         .child(
-                            icon_button(("reveal", ix), "⌕", "Reveal in Finder").on_click(cx.listener(
+                            icon_button(("reveal", ix), "⌕", t!(Tr::RevealInFinder)).on_click(cx.listener(
                                 move |_, _, _, cx| {
                                     cx.stop_propagation();
                                     cx.reveal_path(&path);
                                 },
                             )),
                         )
-                        .child(icon_button(("copy-path", ix), "⧉", "Copy Path").on_click(cx.listener(
+                        .child(icon_button(("copy-path", ix), "⧉", t!(Tr::CopyPath)).on_click(cx.listener(
                             move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                let notice = format!("Copied {}", abbreviate_home(&shown_path));
+                                let notice = tf!(Tr::CopiedPath, "path" => abbreviate_home(&shown_path));
                                 this.copy_to_clipboard(shown_path.clone(), notice, cx);
                             },
                         )))
                         .when(!in_collector && !in_app, |d| {
-                            d.child(icon_button(("collect", ix), "+", "Add to Collector").on_click(cx.listener(
+                            d.child(icon_button(("collect", ix), "+", t!(Tr::AddToCollector)).on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.collect_items(&[ix], cx);
@@ -2755,7 +2796,7 @@ impl Petal {
                     })
                     .when(in_collector, |d| {
                         d.child(
-                            icon_button(("uncollect-row", ix), "✓", "Remove from Collector")
+                            icon_button(("uncollect-row", ix), "✓", t!(Tr::RemoveFromCollector))
                                 .text_color(rgb(ACCENT))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
@@ -2847,17 +2888,17 @@ impl Petal {
                     .rounded_full()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(format!("+{} more", groups.len() - MAX_CHIPS)),
+                    .child(tf!(Tr::MoreChips, "n" => groups.len() - MAX_CHIPS)),
             );
         }
         let size = r.collected_size();
         let frees = r.collector_frees.get();
         let shared_note = frees.filter(|&f| !busy && size > f + size / 100).map(|f| {
-            format!("{} is shared with files outside the selection (APFS clones or hard links), so deleting won't free it", format_size(size - f))
+            tf!(Tr::SharedExplainer, "size" => format_size(size - f))
         });
         let items = match r.collector.len() {
-            1 => "1 item".to_string(),
-            n => format!("{} items", format_count(n as u64)),
+            1 => t!(Tr::OneItem).to_string(),
+            n => tf!(Tr::NItemsWord, "n" => format_count(n as u64)),
         };
 
         div()
@@ -2877,11 +2918,11 @@ impl Petal {
                 div()
                     .flex()
                     .justify_between()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Collector"))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(t!(Tr::Collector)))
                     .when(!empty, |d| {
                         d.child(div().text_color(rgb(MUTED)).child(match frees {
-                            Some(frees) => format!("{items} · frees {}", format_size(frees)),
-                            None => format!("{items} · calculating…"),
+                            Some(frees) => tf!(Tr::CollectorSummary, "items" => items, "freed" => format_size(frees)),
+                            None => tf!(Tr::Calculating, "items" => items),
                         }))
                     }),
             )
@@ -2898,18 +2939,18 @@ impl Petal {
                                 .gap_1()
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(div().text_color(rgb(SAFE)).font_weight(FontWeight::BOLD).child("✓"))
-                                .child(format!("Moved {} to the Trash", trashed.what)),
+                                .child(tf!(Tr::MovedToTrash, "what" => trashed.what)),
                         )
-                        .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                            "Freed {}. You can put items back from the Trash in Finder.",
-                            format_size(trashed.frees)
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(tf!(
+                            Tr::FreedUp,
+                            "freed" => format_size(trashed.frees)
                         ))),
                 ),
                 None => d.child(
                     div()
                         .text_xs()
                         .text_color(rgb(MUTED))
-                        .child("Drag items here (or press + on a row) to collect them for deletion."),
+                        .child(t!(Tr::DragToCollect)),
                 ),
             })
             .when(!empty, |d| {
@@ -2921,13 +2962,13 @@ impl Petal {
                         .items_center()
                         .when(busy, |d| {
                             d.child(
-                                primary_button("trash", "Moving to Trash…", DANGER)
+                                primary_button("trash", t!(Tr::MovingToTrash), DANGER)
                                     .opacity(0.6)
                                     .cursor_default(),
                             )
                         })
                         .when(!busy, |d| {
-                            d.child(button("clear-collector", "Clear").on_click(cx.listener(|this, _, _, cx| {
+                            d.child(button("clear-collector", t!(Tr::Clear)).on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(r) = this.results() {
                                     r.collector.clear();
                                 }
@@ -2935,7 +2976,7 @@ impl Petal {
                                 cx.notify();
                             })))
                             .child(
-                                primary_button("trash", "Move to Trash…", DANGER)
+                                primary_button("trash", t!(Tr::MoveToTrash), DANGER)
                                     .on_click(cx.listener(|this, _, window, cx| this.trash_collected(window, cx))),
                             )
                         }),
@@ -2983,17 +3024,17 @@ impl Petal {
             Some(Target::Node(ix)) => {
                 let node = &tree.nodes[ix];
                 let detail = match node.kind {
-                    Kind::Dir => format!("{} files", format_count(node.items)),
-                    Kind::File => "file".into(),
-                    Kind::Other if node.name.as_ref() == disk::NOT_READABLE => "not readable without more access".into(),
-                    Kind::Other if node.name.as_ref() == disk::SNAPSHOTS_AND_UNREADABLE => "held by APFS snapshots, or not readable".into(),
-                    Kind::Other => "exact, from APFS".into(),
+                    Kind::Dir => tf!(Tr::FilesSuffix, "n" => format_count(node.items)),
+                    Kind::File => t!(Tr::FileWord).into(),
+                    Kind::Other if node.name.as_ref() == disk::NOT_READABLE => t!(Tr::NotReadableMoreAccess).into(),
+                    Kind::Other if node.name.as_ref() == disk::SNAPSHOTS_AND_UNREADABLE => t!(Tr::SnapshotsOrUnreadable).into(),
+                    Kind::Other => t!(Tr::ExactApfs).into(),
                 };
                 let kind = match (r.color_by, r.category(Target::Node(ix))) {
-                    (ColorBy::Kind, Some(category)) if node.kind != Kind::Other => format!("\n{}", category.label()),
+                    (ColorBy::Kind, Some(category)) if node.kind != Kind::Other => format!("\n{}", category_label(category)),
                     (ColorBy::Safety, _) if node.kind != Kind::Other => match r.safety_labels.of(tree, ix) {
-                        Some(label) => format!("\n{} ({})", safety::label(label.safety), label.title),
-                        None => "\nNo finding: not known to be safe".into(),
+                        Some(label) => format!("\n{} ({})", safety::label(label.safety), findings::title_label(label.title)),
+                        None => t!(Tr::NoFindingDetail).into(),
                     },
                     _ => String::new(),
                 };
@@ -3001,10 +3042,10 @@ impl Petal {
             }
             // Only the chart has these: things too small to show on their own, together.
             Some(Target::Small { count, size, .. }) => {
-                let things = if count == 1 { "1 item".to_string() } else { format!("{} items", format_count(count as u64)) };
-                ("Smaller objects".into(), format!("{}\n{things} too small to show", format_size(size)))
+                let things = if count == 1 { t!(Tr::OneItem).to_string() } else { tf!(Tr::NItemsWord, "n" => format_count(count as u64)) };
+                (t!(Tr::SmallerObjects).into(), tf!(Tr::TooSmallDetail, "size" => format_size(size), "things" => things))
             }
-            None if center_hovered => ("↑ Back".into(), r.up_to().map(|up| format!("to “{}”", tree.nodes[up].name)).unwrap_or_default()),
+            None if center_hovered => (t!(Tr::BackUp).into(), r.up_to().map(|up| tf!(Tr::BackTo, "name" => tree.nodes[up].name)).unwrap_or_default()),
             // The treemap's focus bar names it already, just below.
             None if r.chart == ChartType::Treemap => (SharedString::default(), String::new()),
             None => {
@@ -3034,12 +3075,13 @@ impl Petal {
             let pending = r.findings.iter().any(|f| f.pending);
             let safe = findings::safe_total(&r.findings);
             let savings = if pending {
-                " · working out savings…".to_string()
+                format!(" ·{}", t!(Tr::WorkingOutSavings))
             } else if safe > 0 {
-                format!(" · {} safe to delete", format_size(safe))
+                tf!(Tr::SafeSuffix, "size" => format_size(safe))
             } else {
                 String::new()
             };
+            // (the leading separator keeps the two MUTED texts visually joined)
             div()
                 .id("done-banner")
                 .flex_none()
@@ -3055,8 +3097,8 @@ impl Petal {
                 .gap_2()
                 .cursor_pointer()
                 .child(div().text_color(rgb(0x3fb950)).font_weight(FontWeight::BOLD).child("✓"))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Scan complete in {:.1} s", r.elapsed.as_secs_f32())))
-                .child(div().text_color(rgb(MUTED)).child(format!("{} accounted for{savings}", format_size(total))))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(tf!(Tr::ScanComplete, "s" => format!("{:.1}", r.elapsed.as_secs_f32()))))
+                .child(div().text_color(rgb(MUTED)).child(tf!(Tr::AccountedFor, "total" => format_size(total), "savings" => savings)))
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Some(r) = this.results() {
                         r.banner = None;
@@ -3346,10 +3388,10 @@ fn color_toggle(current: ColorBy, caption: bool, cx: &mut Context<Petal>) -> imp
     let option = |id, label, value: ColorBy, cx: &mut Context<Petal>| {
         toggle_option(id, current == value).child(label).on_click(cx.listener(move |this, _, _, cx| this.set_color_by(value, cx)))
     };
-    toggle(caption.then_some("Colour"))
-        .child(option("color-folder", "Folder", ColorBy::Folder, cx))
-        .child(option("color-kind", "Kind", ColorBy::Kind, cx))
-        .child(option("color-safety", "Safety", ColorBy::Safety, cx))
+    toggle(caption.then_some(t!(Tr::ColourCaption)))
+        .child(option("color-folder", t!(Tr::ColourFolder), ColorBy::Folder, cx))
+        .child(option("color-kind", t!(Tr::ColourKind), ColorBy::Kind, cx))
+        .child(option("color-safety", t!(Tr::ColourSafety), ColorBy::Safety, cx))
 }
 
 /// "Chart: Sunburst | Icicle | Treemap" in the toolbar, each with a picture of the chart. In a
@@ -3362,10 +3404,10 @@ fn chart_toggle(current: ChartType, caption: bool, cx: &mut Context<Petal>) -> i
             .tooltip(tooltip(hint))
             .on_click(cx.listener(move |this, _, _, cx| this.set_chart(value, cx)))
     };
-    toggle(caption.then_some("Chart"))
-        .child(option("chart-sunburst", "Sunburst", "Sunburst: rings round the folder (⌘1)", ChartType::Sunburst, cx))
-        .child(option("chart-icicle", "Icicle", "Icicle: rows falling from the folder, with names (⌘2)", ChartType::Icicle, cx))
-        .child(option("chart-treemap", "Treemap", "Treemap: boxes sized by space, one level at a time (⌘3)", ChartType::Treemap, cx))
+    toggle(caption.then_some(t!(Tr::ChartCaption)))
+        .child(option("chart-sunburst", t!(Tr::ChartSunburst), t!(Tr::ChartSunburstTip), ChartType::Sunburst, cx))
+        .child(option("chart-icicle", t!(Tr::ChartIcicle), t!(Tr::ChartIcicleTip), ChartType::Icicle, cx))
+        .child(option("chart-treemap", t!(Tr::ChartTreemap), t!(Tr::ChartTreemapTip), ChartType::Treemap, cx))
 }
 
 /// The box a legend goes in. `in_row`: a row under the chart, rather than a list in its corner.
@@ -3381,7 +3423,14 @@ fn legend_box(in_row: bool) -> gpui::Div {
 /// always clear that grey isn't a verdict.
 fn render_safety_legend(in_row: bool) -> gpui::Div {
     let mut legend = legend_box(in_row);
-    for (verdict, text) in safety::LEGEND {
+    for (verdict, _) in safety::LEGEND {
+        // LEGEND's English text is for tests; the UI names come from the i18n table.
+        let text = match verdict {
+            Some(findings::Safety::Safe) => t!(Tr::SafetySafe),
+            Some(findings::Safety::Review) => t!(Tr::SafetyReview),
+            Some(findings::Safety::ManageInApp) => t!(Tr::SafetyManage),
+            None => t!(Tr::SafetyNoFinding),
+        };
         legend = legend.child(
             div()
                 .flex()
@@ -3421,7 +3470,7 @@ fn render_legend(r: &Results, in_row: bool, cx: &mut Context<Petal>) -> gpui::Di
                     }
                 }))
                 .child(div().size(px(10.)).flex_none().rounded_full().bg(classify::color(category)))
-                .child(category.label()),
+                .child(category_label(category)),
         );
     }
     legend
