@@ -5,10 +5,158 @@ use crate::rules::{self, CleanupAction, CleanupCategory, Plan, Rule, RuleSource}
 use crate::settings::Settings;
 use crate::text_input::TextInput;
 use gpui::Entity;
+use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
+
+#[path = "ai_chat.rs"]
+mod ai_chat;
+use ai_chat::ChatState;
 
 const PAGE_SIZE: usize = 200;
 const AUTO_BUDGET: usize = 200;
+const RULE_ROW_HEIGHT: f32 = 64.;
+const RULE_CATEGORIES: [CleanupCategory; 7] = [
+    CleanupCategory::Temporary,
+    CleanupCategory::Cache,
+    CleanupCategory::Build,
+    CleanupCategory::Logs,
+    CleanupCategory::Downloads,
+    CleanupCategory::Backup,
+    CleanupCategory::Other,
+];
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum RuleStatusFilter {
+    #[default]
+    All,
+    Enabled,
+    Disabled,
+    Automatic,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum RuleSort {
+    #[default]
+    Priority,
+    Name,
+    Status,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleFilterMenu {
+    Source,
+    Category,
+    Sort,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct RuleQuery {
+    search: String,
+    status: RuleStatusFilter,
+    source: Option<RuleSource>,
+    category: Option<CleanupCategory>,
+    sort: RuleSort,
+}
+
+#[derive(Default)]
+struct RuleIndex {
+    revision: Option<u64>,
+    language: crate::i18n::Lang,
+    searchable: Vec<String>,
+    by_id: std::collections::HashMap<String, usize>,
+    query: Option<RuleQuery>,
+    visible: Rc<Vec<usize>>,
+    enabled: usize,
+    automatic: usize,
+}
+
+impl RuleIndex {
+    fn visible(&mut self, rules: &[Rule], revision: u64, query: RuleQuery) -> Rc<Vec<usize>> {
+        let language = crate::i18n::lang();
+        if self.revision != Some(revision) || self.language != language {
+            // Build the text index once per settings revision, not per row or scroll frame.
+            self.searchable = rules.iter().map(|rule| {
+                format!("{} {} {} {} {} {} {} {}", rule.id, rule.name, rule.description,
+                    path_list(&rule.roots), rule.pattern, rule.exclude.join(" "),
+                    category_label(rule.category), source_label(rule.source)).to_lowercase()
+            }).collect();
+            self.by_id = rules.iter().enumerate().map(|(index, rule)| (rule.id.clone(), index)).collect();
+            self.enabled = rules.iter().filter(|rule| rule.enabled).count();
+            self.automatic = rules.iter().filter(|rule| rule.enabled && rule.auto_clean).count();
+            self.revision = Some(revision);
+            self.language = language;
+            self.query = None;
+        }
+        if self.query.as_ref() != Some(&query) {
+            let terms: Vec<_> = query.search.split_whitespace().collect();
+            let mut visible: Vec<_> = rules.iter().enumerate().filter(|(index, rule)| {
+                let status = match query.status {
+                    RuleStatusFilter::All => true,
+                    RuleStatusFilter::Enabled => rule.enabled,
+                    RuleStatusFilter::Disabled => !rule.enabled,
+                    RuleStatusFilter::Automatic => rule.enabled && rule.auto_clean,
+                };
+                status && query.source.is_none_or(|source| rule.source == source)
+                    && query.category.is_none_or(|category| rule.category == category)
+                    && terms.iter().all(|term| self.searchable[*index].contains(term))
+            }).map(|(index, _)| index).collect();
+            visible.sort_by(|&a, &b| {
+                let a = &rules[a];
+                let b = &rules[b];
+                let order = match query.sort {
+                    RuleSort::Priority => b.priority.cmp(&a.priority),
+                    RuleSort::Name => a.name.cmp(&b.name),
+                    RuleSort::Status => b.enabled.cmp(&a.enabled).then(b.priority.cmp(&a.priority)),
+                };
+                order.then(a.name.cmp(&b.name)).then(a.id.cmp(&b.id))
+            });
+            self.visible = Rc::new(visible);
+            self.query = Some(query);
+        }
+        self.visible.clone()
+    }
+
+    fn rule<'a>(&self, rules: &'a [Rule], id: &str) -> Option<&'a Rule> {
+        rules.get(*self.by_id.get(id)?).filter(|rule| rule.id == id)
+    }
+}
+
+fn rule_sort_label(sort: RuleSort) -> &'static str {
+    match sort {
+        RuleSort::Priority => t!(Tr::CpRulesSortPriority),
+        RuleSort::Name => t!(Tr::CpRulesSortName),
+        RuleSort::Status => t!(Tr::CpRulesSortStatus),
+    }
+}
+
+fn rule_detail_field(label: &str, value: impl Into<SharedString>) -> gpui::Div {
+    div().flex().flex_col().gap_1().min_w_0()
+        .child(div().text_xs().text_color(rgb(MUTED)).child(label.to_owned()))
+        .child(div().min_w_0().line_height(relative(1.5)).child(value.into()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AiPhase {
+    Consent,
+    Preparing,
+    Waiting,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+struct AiTurn {
+    request: String,
+    phase: AiPhase,
+    detail: String,
+    answer: Option<String>,
+}
+
+impl AiTurn {
+    fn new(request: String) -> Self {
+        Self { request, phase: AiPhase::Preparing, detail: String::new(), answer: None }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Token {
@@ -37,8 +185,19 @@ pub(super) struct PanelState {
     test_busy: bool,
     ai_busy: bool,
     ai_sequence: u64,
+    ai_config_expanded: bool,
+    ai_turn: Option<AiTurn>,
+    chat: ChatState,
+    ai_scroll: gpui::ScrollHandle,
     response: Option<(Token, AgentResponse)>,
     editor: Option<RuleEditor>,
+    rule_search: Entity<TextInput>,
+    rule_query: RuleQuery,
+    rule_menu: Option<RuleFilterMenu>,
+    rule_selected: Option<String>,
+    rule_scroll: UniformListScrollHandle,
+    rule_editor_scroll: gpui::ScrollHandle,
+    rule_index: RefCell<RuleIndex>,
     url: Entity<TextInput>,
     model: Entity<TextInput>,
     key: Entity<TextInput>,
@@ -136,9 +295,114 @@ fn panel_card() -> gpui::Div {
         .min_w_0()
 }
 
+// The assistant uses quieter surfaces than the dense cleanup tables.
+fn ai_card() -> gpui::Div {
+    div()
+        .p_5()
+        .rounded_xl()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(PANEL))
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .gap_4()
+        .min_w_0()
+}
+
+fn ai_badge(label: impl Into<SharedString>, color: u32) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .bg(rgba((color << 8) | 0x18))
+        .text_xs()
+        .text_color(rgb(color))
+        .child(div().size(px(5.)).rounded_full().bg(rgb(color)))
+        .child(label.into())
+}
+
+fn ai_action(
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    chart: ChartType,
+    enabled: bool,
+) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_1()
+        .flex_basis(px(220.))
+        .min_w(px(200.))
+        .p_4()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(PANEL))
+        .flex()
+        .flex_col()
+        .gap_3()
+        .when(enabled, |d| {
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(CARD)).border_color(rgb(ACCENT)))
+                .active(|s| s.opacity(0.85))
+        })
+        .when(!enabled, |d| d.opacity(0.45))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_color(rgb(ACCENT)).child(icons::chart(chart)))
+                .child(div().font_weight(FontWeight::MEDIUM).child(title)),
+        )
+        .child(div().text_xs().text_color(rgb(MUTED)).child(description))
+}
+
+fn ai_option(
+    id: &'static str,
+    label: &'static str,
+    checked: bool,
+    enabled: bool,
+    color: u32,
+) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .text_xs()
+        .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(CARD))))
+        .when(!enabled, |d| d.opacity(0.45))
+        .child(
+            div()
+                .w(px(26.))
+                .h(px(16.))
+                .px(px(2.))
+                .flex()
+                .items_center()
+                .rounded_full()
+                .bg(rgb(if checked { color } else { BORDER }))
+                .when(checked, |d| d.justify_end())
+                .child(div().size(px(12.)).rounded_full().bg(rgb(TEXT))),
+        )
+        .child(label)
+}
+
 impl PanelState {
     pub(super) fn new(cx: &mut Context<Petal>) -> Self {
-        let settings = Settings::load();
+        let mut state = Self::with_settings(Settings::load(), cx);
+        state.chat.persistence = true;
+        state
+    }
+
+    fn with_settings(settings: Result<Settings, String>, cx: &mut Context<Petal>) -> Self {
         // Input defaults are presentation only. Never turn a failed load into writable defaults.
         let config = settings
             .as_ref()
@@ -150,6 +414,22 @@ impl PanelState {
             .ok()
             .map(|s| s.automation_interval_minutes)
             .unwrap_or(60);
+        let url = input(config.base_url, "https://api.openai.com", false, cx);
+        let model = input(config.model, t!(Tr::CpFieldModel), false, cx);
+        let key = input("", t!(Tr::CpFieldNewKey), true, cx);
+        // Refresh saved-state indicators and enabled actions as inputs change.
+        for entity in [&url, &model, &key] {
+            cx.observe(entity, |_, _, cx| cx.notify()).detach();
+        }
+        let rule_search = input("", t!(Tr::CpRulesSearch), false, cx);
+        cx.observe(&rule_search, |this, entity, cx| {
+            let search = entity.read(cx).text().trim().to_lowercase();
+            if this.cleanup_panel.rule_query.search != search {
+                this.cleanup_panel.rule_query.search = search;
+                this.cleanup_panel.rule_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                cx.notify();
+            }
+        }).detach();
         Self {
             open: false,
             tab: 0,
@@ -170,11 +450,22 @@ impl PanelState {
             test_busy: false,
             ai_busy: false,
             ai_sequence: 0,
+            ai_config_expanded: !config.enabled,
+            ai_turn: None,
+            chat: ChatState::new(cx),
+            ai_scroll: gpui::ScrollHandle::new(),
             response: None,
             editor: None,
-            url: input(config.base_url, "https://api.openai.com", false, cx),
-            model: input(config.model, t!(Tr::CpFieldModel), false, cx),
-            key: input("", t!(Tr::CpFieldNewKey), true, cx),
+            rule_search,
+            rule_query: RuleQuery::default(),
+            rule_menu: None,
+            rule_selected: None,
+            rule_scroll: UniformListScrollHandle::new(),
+            rule_editor_scroll: gpui::ScrollHandle::new(),
+            rule_index: RefCell::new(RuleIndex::default()),
+            url,
+            model,
+            key,
             whitelist: input("", t!(Tr::CpFieldProtectedPaths), false, cx),
             interval: input(minutes.to_string(), t!(Tr::CpFieldInterval), false, cx),
             history: vec![],
@@ -197,6 +488,10 @@ impl Drop for PanelState {
         self.execution_cancel.store(true, Ordering::Release);
         self.preview_cancel.store(true, Ordering::Release);
     }
+}
+
+fn ai_snapshot_current(captured: Token, current: Token) -> bool {
+    captured.scan == current.scan && captured.revision == current.revision
 }
 
 fn editor_conflict(open_revision: u64, current_revision: u64) -> bool {
@@ -292,13 +587,81 @@ impl Petal {
     fn cleanup_current(&self, token: Token) -> bool {
         self.cleanup_token() == Some(token) && self.cleanup_panel.settings.is_ok()
     }
+    // Live refresh invalidates all cleanup plans/drafts, but cannot change the
+    // sealed read-only snapshot already used by an AI conversation.
+    pub(super) fn invalidate_scan_cleanup_jobs(&mut self) {
+        let p = &mut self.cleanup_panel;
+        p.preview_cancel.store(true, Ordering::Release);
+        p.generation = p.generation.wrapping_add(1);
+        p.plan = None;
+        p.selected.clear();
+        if p.response.as_ref().is_some_and(|(_, response)| !response.proposals.is_empty()) {
+            if let Some(turn) = &mut p.ai_turn {
+                turn.detail = t!(Tr::CpAiDraftsExpired).into();
+            }
+        }
+        p.response = None;
+        p.chat.expire_proposals();
+        p.preview_busy = false;
+        p.diagnostic_page = 0;
+        if p.editor.as_ref().is_some_and(|editor| editor.draft_token.is_some()) {
+            p.message = t!(Tr::CpDraftStale).into();
+        }
+    }
+
+    fn ai_current(&self, token: Token) -> bool {
+        self.cleanup_token().is_some_and(|current| ai_snapshot_current(token, current))
+            && self.cleanup_panel.settings.is_ok()
+    }
+
+    fn ai_ready(&self) -> bool {
+        // Read-only AI may explain a partial snapshot during live refresh.
+        // Cleanup still uses the stricter cleanup_ready guard.
+        matches!(&self.screen, Screen::Results(r) if !r.trashing && !r.deleting_snapshots && r.admin != AdminRead::Reading)
+            && self.cleanup_panel.writable()
+    }
+
+    fn revoke_ai_consent(&mut self, disable: bool, cx: &mut Context<Self>) {
+        let Ok(settings) = &mut self.cleanup_panel.settings else { return };
+        settings.agent.privacy_consent = None;
+        if disable { settings.agent.enabled = false; }
+        // Revocation takes effect even if persistence fails, like automation revocation.
+        let result = settings.save();
+        self.cleanup_panel.revision = self.cleanup_panel.revision.wrapping_add(1);
+        self.invalidate_cleanup_jobs();
+        match result {
+            Ok(()) => self.panel_message(t!(Tr::CpAiConsentRevoked), cx),
+            Err(error) => self.panel_message(tf!(Tr::CpAiRevokeSaveFailed, "e" => error), cx),
+        }
+    }
+
+    fn set_ai_phase(&mut self, phase: AiPhase, detail: impl Into<String>, cx: &mut Context<Self>) {
+        let detail = ai_chat::bounded_detail(detail.into(), 60 * 1024);
+        if let Some(turn) = &mut self.cleanup_panel.ai_turn {
+            turn.phase = phase;
+            turn.detail = detail.clone();
+        }
+        self.cleanup_panel.chat.set_phase(phase, detail);
+        self.queue_chat_save(cx);
+        cx.notify();
+    }
+
     pub(super) fn invalidate_cleanup_jobs(&mut self) {
+        if self.cleanup_panel.ai_busy {
+            if let Some(turn) = &mut self.cleanup_panel.ai_turn {
+                turn.phase = AiPhase::Cancelled;
+                turn.detail = t!(Tr::CpAiRequestChanged).into();
+            }
+        }
         let p = &mut self.cleanup_panel;
         p.preview_cancel.store(true, Ordering::Release);
         p.generation = p.generation.wrapping_add(1);
         p.plan = None;
         p.selected.clear();
         p.response = None;
+        p.chat.set_phase(AiPhase::Cancelled, t!(Tr::CpAiRequestChanged).into());
+        p.chat.expire_proposals();
+        p.chat.live = None;
         p.ai_sequence = p.ai_sequence.wrapping_add(1);
         p.ai_busy = false;
         p.preview_busy = false;
@@ -737,6 +1100,10 @@ impl Petal {
         if !self.cleanup_panel.writable() {
             return;
         }
+        if draft.is_some() && !self.cleanup_ready() {
+            self.panel_message(t!(Tr::CpAiDraftsExpired), cx);
+            return;
+        }
         let draft_token = draft.as_ref().and_then(|_| self.cleanup_token());
         if self.cleanup_panel.editor.is_some() {
             self.panel_message(t!(Tr::CpEditorAlreadyOpen), cx);
@@ -746,6 +1113,9 @@ impl Petal {
         editor.open_revision = self.cleanup_panel.revision;
         editor.draft_token = draft_token;
         window.focus(&editor.name.read(cx).focus_handle(), cx);
+        self.cleanup_panel.rule_selected = Some(editor.rule.id.clone());
+        self.cleanup_panel.rule_menu = None;
+        self.cleanup_panel.rule_editor_scroll = gpui::ScrollHandle::new();
         self.cleanup_panel.editor = Some(editor);
         self.cleanup_panel.tab = 1;
         cx.notify();
@@ -787,7 +1157,7 @@ impl Petal {
         }
         if editor
             .draft_token
-            .is_some_and(|token| !self.cleanup_current(token))
+            .is_some_and(|token| !self.cleanup_current(token) || !self.cleanup_ready())
         {
             self.panel_message(t!(Tr::CpDraftScanChanged), cx);
             return;
@@ -864,7 +1234,8 @@ impl Petal {
         let Some((token, response)) = &self.cleanup_panel.response else {
             return;
         };
-        if !self.cleanup_current(*token) {
+        if !self.cleanup_current(*token) || !self.cleanup_ready() {
+            self.panel_message(t!(Tr::CpAiDraftsExpired), cx);
             return;
         }
         let Some(mut rule) = response.proposals.iter().find(|r| r.id == id).cloned() else {
@@ -1071,7 +1442,9 @@ impl Petal {
         window.focus(&self.focus_handle, cx);
         self.cleanup_panel.open = true;
         self.cleanup_panel.tab = 2;
+        self.cleanup_panel.ai_scroll = gpui::ScrollHandle::new();
         self.request_panel_ai(request, Some(ix), window, cx);
+        cx.notify();
     }
     fn request_panel_ai(
         &mut self,
@@ -1080,19 +1453,48 @@ impl Petal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.cleanup_panel.ai_busy || !self.cleanup_ready() {
+        if self.cleanup_panel.ai_busy {
+            self.panel_message(t!(Tr::CpAiAlreadyBusy), cx);
             return;
         }
-        let Ok(settings) = self.cleanup_panel.settings.clone() else {
-            return;
+        let manual = self.cleanup_panel.chat.next_input.take();
+        let label = match &request {
+            AgentRequest::Analyze => t!(Tr::CpAnalyzeDisk).to_string(),
+            AgentRequest::Explain { path } => tf!(Tr::CpAiExplainRequest, "path" => path.to_string_lossy()),
+            AgentRequest::GenerateRules => t!(Tr::CpGenerateDrafts).to_string(),
         };
+        self.cleanup_panel.ai_turn = Some(AiTurn::new(label.clone()));
+        self.cleanup_panel.response = None;
+        self.cleanup_panel.ai_scroll = gpui::ScrollHandle::new();
+        if !self.ai_ready() {
+            self.set_ai_phase(AiPhase::Failed, t!(Tr::CpAiNotReady), cx);
+            return;
+        }
+        let Ok(settings) = self.cleanup_panel.settings.clone() else { return };
         if !settings.agent.enabled {
-            self.panel_message(t!(Tr::CpAiNotEnabled), cx);
+            self.set_ai_phase(AiPhase::Failed, t!(Tr::CpAiNotEnabled), cx);
+            self.cleanup_panel.ai_config_expanded = true;
             return;
         }
-        let Some(token) = self.cleanup_token() else {
+        if text(&self.cleanup_panel.url, cx) != settings.agent.base_url
+            || text(&self.cleanup_panel.model, cx) != settings.agent.model {
+            self.set_ai_phase(AiPhase::Failed, t!(Tr::CpAiServiceHint), cx);
             return;
-        };
+        }
+        let Some(token) = self.cleanup_token() else { return };
+        let wire = manual.as_ref().map(|(text, _)| text.clone()).unwrap_or_else(|| match &request {
+            AgentRequest::Analyze => "analyze current disk",
+            AgentRequest::Explain { .. } => "explain selected item",
+            AgentRequest::GenerateRules => "generate safe rules",
+        }.into());
+        let display = manual.as_ref().map(|(text, _)| text.clone()).unwrap_or(label);
+        if !self.cleanup_panel.chat.begin(display.clone(), wire, manual, true) {
+            self.panel_message(t!(Tr::CpChatLimit), cx);
+            return;
+        }
+        self.cleanup_panel.ai_turn = Some(AiTurn::new(display));
+        self.load_chat_archive(cx);
+        let needs_consent = !settings.agent.has_privacy_consent();
         let node_count = match &self.screen {
             Screen::Results(r) => r.tree.nodes.len(),
             _ => return,
@@ -1103,127 +1505,131 @@ impl Petal {
             "protocol" => settings.agent.protocol.label(),
             "model" => settings.agent.model,
             "nodes" => node_count,
-            "paths" => if settings.agent.share_paths {
-                t!(Tr::CpPathsFull)
-            } else {
-                t!(Tr::CpPathsOpaque)
-            }
+            "paths" => if settings.agent.share_paths { t!(Tr::CpPathsFull) } else { t!(Tr::CpPathsOpaque) }
         );
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            t!(Tr::CpConfirmAnalyze),
-            Some(&detail),
-            &[t!(Tr::CpSendSummary), t!(Tr::Cancel)],
-            cx,
-        );
+        let detail = format!("{detail}\n\n{}", t!(Tr::CpChatPrivacy));
+        let answer = needs_consent.then(|| window.prompt(
+            PromptLevel::Warning, t!(Tr::CpConfirmAnalyze), Some(&detail),
+            &[t!(Tr::CpSendSummary), t!(Tr::Cancel)], cx,
+        ));
         self.cleanup_panel.ai_busy = true;
         self.cleanup_panel.ai_sequence = self.cleanup_panel.ai_sequence.wrapping_add(1);
         let sequence = self.cleanup_panel.ai_sequence;
-        self.panel_message(t!(Tr::CpWaitingConsent), cx);
+        self.cleanup_panel.message.clear();
+        self.set_ai_phase(
+            if needs_consent { AiPhase::Consent } else { AiPhase::Preparing },
+            if needs_consent { t!(Tr::CpWaitingConsent) } else { t!(Tr::CpAiPreparing) }, cx,
+        );
         cx.spawn(async move |this, cx| {
-            if answer.await != Ok(0) {
-                this.update(cx, |this, cx| {
-                    if sequence == this.cleanup_panel.ai_sequence {
-                        this.cleanup_panel.ai_busy = false;
-                        cx.notify();
-                    }
-                })
-                .ok();
-                return;
-            }
-            // The captured node hint belongs to token.scan; validate the token before using it.
-            // Only bounded structural copying after consent; metadata IO stays off-thread.
-            let snapshot = this
-                .update(cx, |this, cx| {
-                    if this.cleanup_panel.ai_sequence != sequence {
-                        return None;
-                    }
-                    if !this.cleanup_current(token) || !this.cleanup_ready() {
-                        this.cleanup_panel.ai_busy = false;
-                        cx.notify();
-                        return None;
-                    }
-                    let Screen::Results(r) = &this.screen else {
-                        return None;
-                    };
-                    match agent::prepare_snapshot_with_selection(
-                        &r.tree,
-                        &r.findings,
-                        &settings,
-                        &request,
-                        selected_node,
-                    ) {
-                        Ok(snapshot) => Some(snapshot),
-                        Err(error) => {
+            if let Some(answer) = answer {
+                if answer.await != Ok(0) {
+                    this.update(cx, |this, cx| {
+                        if sequence == this.cleanup_panel.ai_sequence {
                             this.cleanup_panel.ai_busy = false;
-                            this.panel_message(error, cx);
-                            None
+                            this.set_ai_phase(AiPhase::Cancelled, t!(Tr::CpAiConsentCancelled), cx);
                         }
+                    }).ok();
+                    return;
+                }
+            }
+            let snapshot = this.update(cx, |this, cx| {
+                if this.cleanup_panel.ai_sequence != sequence { return None; }
+                if !this.ai_current(token) || !this.ai_ready() {
+                    this.cleanup_panel.ai_busy = false;
+                    this.set_ai_phase(AiPhase::Cancelled, t!(Tr::CpAiRequestChanged), cx);
+                    return None;
+                }
+                if needs_consent {
+                    // Persist only the receipt: no revision bump, job invalidation,
+                    // or overwrite of newer settings captured while the prompt was open.
+                    let Ok(mut next) = this.cleanup_panel.settings.clone() else { return None };
+                    if let Err(error) = next.agent.remember_privacy_consent().and_then(|_| next.save()) {
+                        this.cleanup_panel.ai_busy = false;
+                        this.set_ai_phase(AiPhase::Failed, tf!(Tr::CpSaveFailed, "e" => error), cx);
+                        return None;
                     }
-                })
-                .ok()
-                .flatten();
-            let Some((tree, findings)) = snapshot else {
-                return;
-            };
-            // Context uses snapshot-local IDs only; never forward the original node hint.
+                    this.cleanup_panel.settings = Ok(next);
+                }
+                this.set_ai_phase(AiPhase::Preparing, t!(Tr::CpAiPreparing), cx);
+                let Screen::Results(r) = &this.screen else { return None };
+                // Live refresh can change node IDs; drop the old hint and resolve
+                // the path when the generation changed while consent was open.
+                let selection = if this.cleanup_current(token) { selected_node } else { None };
+                match agent::prepare_snapshot_with_selection(&r.tree, &r.findings, &settings, &request, selection) {
+                    Ok(snapshot) => Some((this.cleanup_token().unwrap(), this.cleanup_ready(), snapshot)),
+                    Err(error) => {
+                        this.cleanup_panel.ai_busy = false;
+                        this.set_ai_phase(AiPhase::Failed, error, cx);
+                        None
+                    }
+                }
+            }).ok().flatten();
+            let Some((snapshot_token, draft_eligible, (tree, findings))) = snapshot else { return };
             let context_request = request.clone();
             let context_settings = settings.clone();
-            let context = cx
-                .background_spawn(async move {
-                    agent::context_from_tree(&tree, &findings, &context_settings, &context_request)
-                })
-                .await;
-            // Recheck after potentially slow metadata/context construction, immediately before networking.
-            let valid = this
-                .update(cx, |this, cx| {
-                    if this.cleanup_panel.ai_sequence != sequence {
-                        return false;
-                    }
-                    if !this.cleanup_current(token) || !this.cleanup_ready() {
-                        this.cleanup_panel.ai_busy = false;
-                        cx.notify();
-                        return false;
-                    }
-                    true
-                })
-                .unwrap_or(false);
-            if !valid {
-                return;
-            }
-            let response = match context {
-                Ok(context) => {
-                    cx.background_spawn(
-                        async move { agent::run(&settings.agent, context, request) },
-                    )
-                    .await
+            let context = cx.background_spawn(async move {
+                agent::context_from_tree(&tree, &findings, &context_settings, &context_request)
+            }).await;
+            let context = match context {
+                Ok(context) => context,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        if this.cleanup_panel.ai_sequence == sequence {
+                            this.cleanup_panel.ai_busy = false;
+                            this.set_ai_phase(AiPhase::Failed, error, cx);
+                        }
+                    }).ok();
+                    return;
                 }
-                Err(e) => Err(e),
             };
+            let sealed_context = context.clone();
+            let sealed_request = request.clone();
+            let valid = this.update(cx, |this, cx| {
+                if this.cleanup_panel.ai_sequence != sequence { return false; }
+                if !this.ai_current(snapshot_token) || !this.ai_ready() {
+                    this.cleanup_panel.ai_busy = false;
+                    this.set_ai_phase(AiPhase::Cancelled, t!(Tr::CpAiRequestChanged), cx);
+                    return false;
+                }
+                this.cleanup_panel.chat.seal(sealed_context, sealed_request, snapshot_token);
+                this.set_ai_phase(AiPhase::Waiting, t!(Tr::CpAiWaitingResponse), cx);
+                true
+            }).unwrap_or(false);
+            if !valid { return; }
+            let messages = this.update(cx, |this, _| this.cleanup_panel.chat.pending_messages()).unwrap_or_default();
+            let result = cx.background_spawn(async move {
+                agent::run_conversation(&settings.agent, context, request, messages)
+            }).await;
             this.update(cx, |this, cx| {
-                if this.cleanup_panel.ai_sequence != sequence {
-                    return;
-                }
+                if !ai_chat::response_current(sequence, this.cleanup_panel.ai_sequence, this.cleanup_panel.ai_busy) { return; }
                 this.cleanup_panel.ai_busy = false;
-                if !this.cleanup_current(token) {
-                    cx.notify();
+                if !this.ai_current(snapshot_token) {
+                    this.set_ai_phase(AiPhase::Cancelled, t!(Tr::CpAiRequestChanged), cx);
                     return;
                 }
-                match response {
+                match result {
                     Ok(response) => {
-                        this.cleanup_panel.response = Some((token, response));
-                        this.panel_message(t!(Tr::CpAdvisoryNotice), cx);
+                        if let Some(turn) = &mut this.cleanup_panel.ai_turn {
+                            turn.answer = Some(response.explanation.clone());
+                        }
+                        let current = draft_eligible && this.cleanup_current(snapshot_token) && this.cleanup_ready();
+                        let has_drafts = !response.proposals.is_empty();
+                        this.cleanup_panel.chat.complete(&response, snapshot_token, current, cx);
+                        // Keep read-only text but never expose stale draft actions.
+                        if current { this.cleanup_panel.response = Some((snapshot_token, response)); }
+                        this.set_ai_phase(AiPhase::Complete,
+                            if !current && has_drafts { t!(Tr::CpAiDraftsExpired) } else { t!(Tr::CpAiSnapshotNotice) }, cx);
                     }
-                    Err(e) => this.panel_message(e, cx),
+                    Err(error) => this.set_ai_phase(AiPhase::Failed, error, cx),
                 }
-            })
-            .ok();
-        })
-        .detach();
+            }).ok();
+        }).detach();
     }
     pub(super) fn start_cleanup_scheduler(&mut self, cx: &mut Context<Self>) {
+        self.load_chat_archive(cx);
         cx.spawn(async move |this, cx| {
             loop {
+                this.update(cx, |this, cx| this.queue_chat_save(cx)).ok();
                 cx.background_executor()
                     .timer(Duration::from_secs(60))
                     .await;
@@ -1280,7 +1686,7 @@ impl Petal {
         .detach();
     }
 
-    pub(super) fn render_cleanup_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+    pub(super) fn render_cleanup_panel(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let p = &self.cleanup_panel;
         let mut tabs = row();
         if p.cleanup_busy {
@@ -1308,6 +1714,7 @@ impl Petal {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.cleanup_panel.tab = i;
+                        if i == 2 { this.load_chat_archive(cx); }
                         cx.notify();
                     })),
             );
@@ -1316,11 +1723,15 @@ impl Petal {
             .id("cleanup-panel-scroll")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .min_w_0()
+            .when((p.tab != 1 || p.settings.is_err()) && !(p.tab == 2 && p.chat.has_history()), |d| d.overflow_y_scroll())
             .flex()
             .flex_col()
             .gap_3()
-            .p_3();
+            .p_3()
+            .when(p.tab == 1 && p.settings.is_ok(), |d| d.p_0().overflow_hidden())
+            .when(p.tab == 2 && !p.chat.has_history(), |d| d.p_6().track_scroll(&p.ai_scroll))
+            .when(p.tab == 2 && p.chat.has_history(), |d| d.overflow_hidden());
         if let Err(error) = &p.settings {
             body = body.child(
                 panel_card()
@@ -1338,15 +1749,16 @@ impl Petal {
                         )),
                     ),
             );
+            if p.tab == 2 { body = body.child(self.render_chat_workspace(false, window.viewport_size().width < px(820.), cx)); }
         } else {
             body = body.child(match p.tab {
                 0 => self.render_cleanup_preview(cx),
-                1 => self.render_cleanup_rules(cx),
-                2 => self.render_cleanup_ai(cx),
+                1 => self.render_cleanup_rules(window, cx),
+                2 => self.render_cleanup_ai(window, cx),
                 _ => self.render_cleanup_settings(cx),
             });
         }
-        if !p.message.is_empty() {
+        if !p.message.is_empty() && (!matches!(p.tab, 1 | 2) || p.settings.is_err()) {
             body = body.child(panel_card().child(p.message.clone()));
         }
         div()
@@ -1558,29 +1970,309 @@ impl Petal {
                 ),
         )
     }
-    fn render_cleanup_rules(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn reset_rule_filters(&mut self, cx: &mut Context<Self>) {
+        self.cleanup_panel.rule_query = RuleQuery::default();
+        self.cleanup_panel.rule_menu = None;
+        self.cleanup_panel.rule_search.update(cx, |input, cx| input.set_text("", cx));
+        self.cleanup_panel.rule_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn toggle_managed_rule(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.cleanup_panel.writable() || self.cleanup_panel.editor.is_some() {
+            return;
+        }
+        let Ok(mut next) = self.cleanup_panel.settings.clone() else { return };
+        let Some(rule) = next.rules.iter_mut().find(|rule| rule.id == id) else { return };
+        rule.enabled = !rule.enabled;
+        self.save_panel_settings(next, cx);
+    }
+
+    fn render_cleanup_rules(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let p = &self.cleanup_panel;
-        let mut view =
-            panel_card().child(
-                row()
-                    .child(button("new-rule", t!(Tr::CpNewRule)).on_click(
-                        cx.listener(|this, _, window, cx| this.new_panel_rule(window, cx)),
-                    ))
-                    .child(t!(Tr::CpRulesIntro)),
+        let Ok(settings) = &p.settings else { return div() };
+        let visible = p.rule_index.borrow_mut().visible(&settings.rules, p.revision, p.rule_query.clone());
+        let (enabled, automatic) = {
+            let index = p.rule_index.borrow();
+            (index.enabled, index.automatic)
+        };
+        let can_modify = p.writable() && p.editor.is_none();
+        let has_detail = p.editor.is_some() || p.rule_selected.as_ref()
+            .is_some_and(|id| p.rule_index.borrow().rule(&settings.rules, id).is_some());
+        let compact = has_detail && window.viewport_size().width < px(1100.);
+        let mut filters = row().gap_1();
+        for (i, (status, label)) in [
+            (RuleStatusFilter::All, t!(Tr::CpRulesAll)),
+            (RuleStatusFilter::Enabled, t!(Tr::CpRulesEnabled)),
+            (RuleStatusFilter::Disabled, t!(Tr::CpRulesDisabled)),
+            (RuleStatusFilter::Automatic, t!(Tr::CpRulesAutomatic)),
+        ].into_iter().enumerate() {
+            filters = filters.child(
+                button(("rule-status-filter", i), label).text_xs().bg(rgb(PANEL))
+                    .when(p.rule_query.status == status, |d| d.bg(rgba(ACCENT_TINT)).text_color(rgb(ACCENT)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        window.focus(&this.focus_handle, cx);
+                        this.cleanup_panel.rule_query.status = status;
+                        this.cleanup_panel.rule_menu = None;
+                        this.cleanup_panel.rule_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        cx.notify();
+                    })),
             );
+        }
+        for (i, (menu, label, value)) in [
+            (RuleFilterMenu::Source, t!(Tr::CpRulesSource), p.rule_query.source.map(source_label).unwrap_or(t!(Tr::CpRulesAllSources))),
+            (RuleFilterMenu::Category, t!(Tr::CpRulesCategory), p.rule_query.category.map(category_label).unwrap_or(t!(Tr::CpRulesAllCategories))),
+            (RuleFilterMenu::Sort, t!(Tr::CpRulesSort), rule_sort_label(p.rule_query.sort)),
+        ].into_iter().enumerate() {
+            filters = filters.child(
+                button(("rule-filter-menu", i), format!("{label}: {value}  {}", if p.rule_menu == Some(menu) { "⌄" } else { "›" }))
+                    .text_xs().bg(rgb(PANEL))
+                    .when(p.rule_menu == Some(menu), |d| d.text_color(rgb(ACCENT)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        window.focus(&this.focus_handle, cx);
+                        this.cleanup_panel.rule_menu = if this.cleanup_panel.rule_menu == Some(menu) { None } else { Some(menu) };
+                        cx.notify();
+                    })),
+            );
+        }
+        if p.rule_query != RuleQuery::default() {
+            filters = filters.child(button("rules-reset", t!(Tr::CpRulesReset)).text_xs().text_color(rgb(MUTED))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    this.reset_rule_filters(cx);
+                })));
+        }
+        let mut toolbar = div().p_4().flex_none().flex().flex_col().gap_3().border_b_1().border_color(rgb(BORDER))
+            .child(row().justify_between()
+                .child(div().flex().flex_col().gap_1()
+                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(t!(Tr::CpTabRules)))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpRulesSubtitle))))
+                .child(primary_button("new-rule", t!(Tr::CpRulesNewTitle), ACCENT)
+                    .tooltip(tooltip(t!(Tr::CpNewRule)))
+                    .when(!can_modify, |d| d.opacity(0.45))
+                    .when(can_modify, |d| d.on_click(cx.listener(|this, _, window, cx| this.new_panel_rule(window, cx))))))
+            .child(row().gap_3()
+                .child(div().w(px(300.)).max_w_full().id("rules-search-field")
+                    .tooltip(tooltip(t!(Tr::CpRulesSearchLabel))).child(p.rule_search.clone()))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(tf!(Tr::CpRulesCount, "visible" => visible.len(), "total" => settings.rules.len())))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(tf!(Tr::CpRulesStats, "enabled" => enabled, "automatic" => automatic))))
+            .child(filters);
+        if p.rule_menu.is_some() {
+            toolbar = toolbar.child(self.render_rule_filter_choices(cx));
+        }
+        if p.editor.is_some() {
+            toolbar = toolbar.child(div().text_xs().text_color(rgb(WARNING)).child(t!(Tr::CpRulesEditingHint)));
+        }
+        let mut table = div().debug_selector(|| "rules-table".into()).flex_1().min_w_0().min_h_0().flex().flex_col()
+            .child(div().h(px(34.)).flex_none().px_4().flex().items_center().gap_3().bg(rgb(PANEL)).text_xs().text_color(rgb(MUTED))
+                .child(div().flex_1().min_w_0().child(t!(Tr::CpRulesColumnName)))
+                .when(!compact, |d| d
+                    .child(div().w(px(76.)).flex_none().child(t!(Tr::CpRulesSource)))
+                    .child(div().w(px(76.)).flex_none().child(t!(Tr::CpRulesCategory))))
+                .child(div().w(px(90.)).flex_none().child(t!(Tr::CpRulesColumnStatus)))
+                .when(!compact, |d| d.child(div().w(px(54.)).flex_none().text_right().child(t!(Tr::CpRulesColumnPriority)))));
+        if visible.is_empty() {
+            table = table.child(div().flex_1().flex().flex_col().items_center().justify_center().gap_3().p_5()
+                .child(div().font_weight(FontWeight::MEDIUM).child(if settings.rules.is_empty() { t!(Tr::CpRulesEmpty) } else { t!(Tr::CpRulesNoMatch) }))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(if settings.rules.is_empty() { t!(Tr::CpRulesEmptyHint) } else { t!(Tr::CpRulesNoMatchHint) })));
+        } else {
+            table = table.child(div().flex_1().min_h_0().child(
+                uniform_list("managed-rules", visible.len(), cx.processor(Self::render_rule_rows))
+                    .track_scroll(&p.rule_scroll).size_full(),
+            ));
+        }
+        let detail = self.render_rule_detail(cx);
+        let mut view = div().size_full().min_h_0().min_w_0().flex().flex_col().child(toolbar)
+            .child(div().flex_1().min_h_0().min_w_0().flex().child(table).when_some(detail, |d, detail| d.child(detail)));
+        if !p.message.is_empty() {
+            view = view.child(div().flex_none().px_4().py_2().border_t_1().border_color(rgb(BORDER))
+                .text_xs().text_color(rgb(MUTED)).max_h(px(64.)).id("rules-notice").overflow_y_scroll().child(p.message.clone()));
+        }
+        view
+    }
+
+    fn render_rule_filter_choices(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = &self.cleanup_panel;
+        let mut choices = row().p_2().rounded_lg().bg(rgb(PANEL));
+        match p.rule_menu {
+            Some(RuleFilterMenu::Source) => {
+                for (i, source) in [None, Some(RuleSource::BuiltIn), Some(RuleSource::User), Some(RuleSource::Ai)].into_iter().enumerate() {
+                    choices = choices.child(button(("rule-source-choice", i), source.map(source_label).unwrap_or(t!(Tr::CpRulesAllSources)))
+                        .text_xs().when(p.rule_query.source == source, |d| d.text_color(rgb(ACCENT)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cleanup_panel.rule_query.source = source;
+                            this.cleanup_panel.rule_menu = None;
+                            this.cleanup_panel.rule_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            cx.notify();
+                        })));
+                }
+            }
+            Some(RuleFilterMenu::Category) => {
+                for (i, category) in std::iter::once(None).chain(RULE_CATEGORIES.map(Some)).enumerate() {
+                    choices = choices.child(button(("rule-category-choice", i), category.map(category_label).unwrap_or(t!(Tr::CpRulesAllCategories)))
+                        .text_xs().when(p.rule_query.category == category, |d| d.text_color(rgb(ACCENT)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cleanup_panel.rule_query.category = category;
+                            this.cleanup_panel.rule_menu = None;
+                            this.cleanup_panel.rule_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            cx.notify();
+                        })));
+                }
+            }
+            Some(RuleFilterMenu::Sort) => {
+                for (i, sort) in [RuleSort::Priority, RuleSort::Name, RuleSort::Status].into_iter().enumerate() {
+                    choices = choices.child(button(("rule-sort-choice", i), rule_sort_label(sort))
+                        .text_xs().when(p.rule_query.sort == sort, |d| d.text_color(rgb(ACCENT)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cleanup_panel.rule_query.sort = sort;
+                            this.cleanup_panel.rule_menu = None;
+                            this.cleanup_panel.rule_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            cx.notify();
+                        })));
+                }
+            }
+            None => {}
+        }
+        choices
+    }
+
+    fn render_rule_rows(&mut self, range: Range<usize>, window: &mut Window, cx: &mut Context<Self>) -> Vec<Stateful<gpui::Div>> {
+        let p = &self.cleanup_panel;
+        let Ok(settings) = &p.settings else { return vec![] };
+        let visible = p.rule_index.borrow_mut().visible(&settings.rules, p.revision, p.rule_query.clone());
+        let has_detail = p.editor.is_some() || p.rule_selected.as_ref()
+            .is_some_and(|id| p.rule_index.borrow().rule(&settings.rules, id).is_some());
+        let compact = has_detail && window.viewport_size().width < px(1100.);
+        range.filter_map(|row_index| {
+            let rule = settings.rules.get(*visible.get(row_index)?)?;
+            let id = rule.id.clone();
+            let selected = p.rule_selected.as_ref() == Some(&id);
+            let detail = format!("{} · {}", path_list(&rule.roots), rule.pattern);
+            Some(div().debug_selector(|| format!("rule-row-{}", rule.id))
+                .id(SharedString::from(format!("managed-rule-{}", rule.id)))
+                .h(px(RULE_ROW_HEIGHT)).w_full().px_4().flex().items_center().gap_3()
+                .border_b_1().border_color(rgb(BORDER)).cursor_pointer()
+                .when(selected, |d| d.bg(rgba(ACCENT_TINT)))
+                .when(!selected, |d| d.hover(|s| s.bg(rgb(PANEL))))
+                .child(div().debug_selector(|| "rule-name-cell".into()).flex_1().min_w_0().flex().flex_col().gap_1()
+                    .child(div().truncate().font_weight(FontWeight::MEDIUM).child(rule.name.clone()))
+                    .child(div().truncate().text_xs().text_color(rgb(MUTED)).child(detail)))
+                .when(!compact, |d| d
+                    .child(div().w(px(76.)).flex_none().truncate().text_xs().text_color(rgb(MUTED)).child(source_label(rule.source)))
+                    .child(div().w(px(76.)).flex_none().truncate().text_xs().text_color(rgb(MUTED)).child(category_label(rule.category))))
+                .child(div().w(px(90.)).flex_none().flex().flex_col().gap_1().text_xs()
+                    .child(div().text_color(rgb(if rule.enabled { SAFE } else { MUTED })).child(if rule.enabled { t!(Tr::CpRulesEnabled) } else { t!(Tr::CpRulesDisabled) }))
+                    .when(rule.enabled && rule.auto_clean, |d| d.child(div().truncate().text_color(rgb(ACCENT)).child(t!(Tr::CpRulesAutomatic)))))
+                .when(!compact, |d| d.child(div().w(px(54.)).flex_none().text_right().text_xs().text_color(rgb(MUTED)).child(rule.priority.to_string())))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    if this.cleanup_panel.editor.is_some() { return }
+                    this.cleanup_panel.rule_selected = Some(id.clone());
+                    this.cleanup_panel.rule_menu = None;
+                    cx.notify();
+                })))
+        }).collect()
+    }
+
+    fn render_rule_detail(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let p = &self.cleanup_panel;
+        let settings = p.settings.as_ref().ok()?;
+        let rule = p.rule_selected.as_ref().and_then(|id| p.rule_index.borrow().rule(&settings.rules, id));
+        if p.editor.is_none() && rule.is_none() { return None }
+        let title = if p.editor.is_some() { t!(Tr::CpRulesEditTitle) } else { t!(Tr::CpRulesDetail) };
+        let mut body = div().id(SharedString::from(format!("rule-{}-{}",
+                if p.editor.is_some() { "editor" } else { "detail" },
+                p.editor.as_ref().map(|editor| editor.rule.id.as_str())
+                    .or(p.rule_selected.as_deref()).unwrap_or_default())))
+            .flex_1().min_h_0().overflow_y_scroll()
+            .when(p.editor.is_some(), |d| d.track_scroll(&p.rule_editor_scroll))
+            .p_4().flex().flex_col().gap_4().min_w_0();
+        if p.editor.is_some() {
+            body = body.child(self.render_rule_editor(cx));
+        } else if let Some(rule) = rule {
+            body = body.child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(rule.name.clone()))
+                .child(row().child(ai_badge(source_label(rule.source), MUTED)).child(ai_badge(category_label(rule.category), ACCENT)))
+                .child(div().line_height(relative(1.5)).text_color(rgb(MUTED)).child(if rule.description.is_empty() { t!(Tr::CpRulesNoDescription).to_owned() } else { rule.description.clone() }))
+                .child(rule_detail_field(t!(Tr::CpRulesId), rule.id.clone()))
+                .child(div().pt_3().border_t_1().border_color(rgb(BORDER)).font_weight(FontWeight::MEDIUM).child(t!(Tr::CpRulesConditions)))
+                .child(rule_detail_field(t!(Tr::CpFieldScopePaths), path_list(&rule.roots)))
+                .child(rule_detail_field(t!(Tr::CpFieldMatchGlobs), rule.pattern.clone()))
+                .child(rule_detail_field(t!(Tr::CpFieldExcludeGlobsShort), if rule.exclude.is_empty() { t!(Tr::CpRulesNoExcludes).to_owned() } else { rule.exclude.join("; ") }))
+                .child(row().items_start()
+                    .child(rule_detail_field(t!(Tr::CpFieldMinSize), rule.min_size.to_string()).flex_1())
+                    .child(rule_detail_field(t!(Tr::CpFieldKeepDaysShort), rule.older_than_days.map(|days| days.to_string()).unwrap_or_else(|| t!(Tr::CpNoLimit).into())).flex_1()))
+                .child(rule_detail_field(t!(Tr::CpFieldPriorityShort), rule.priority.to_string()))
+                .child(div().pt_3().border_t_1().border_color(rgb(BORDER)).font_weight(FontWeight::MEDIUM).child(t!(Tr::CpRulesBehavior)))
+                .child(row().child(ai_badge(if rule.enabled { t!(Tr::CpRulesEnabled) } else { t!(Tr::CpRulesDisabled) }, if rule.enabled { SAFE } else { MUTED }))
+                    .child(div().text_xs().text_color(rgb(if rule.action == CleanupAction::Permanent { DANGER } else { TEXT })).child(action_label(rule.action))))
+                .child(rule_detail_field(t!(Tr::CpRulesAutomatic), if rule.auto_clean { t!(Tr::CpAuthorized) } else { t!(Tr::CpOff) }))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpRulesAutoHint)))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpRulesIntro)));
+            let editable = p.writable();
+            let toggle_id = rule.id.clone();
+            let edit_id = rule.id.clone();
+            let delete_id = rule.id.clone();
+            body = body.child(row().pt_3().border_t_1().border_color(rgb(BORDER))
+                .child(button("managed-rule-toggle", if rule.enabled { t!(Tr::CpRulesDisableAction) } else { t!(Tr::CpRulesEnableAction) })
+                    .when(!editable, |d| d.opacity(0.45))
+                    .when(editable, |d| d.on_click(cx.listener(move |this, _, _, cx| this.toggle_managed_rule(&toggle_id, cx)))))
+                .child(primary_button("managed-rule-edit", t!(Tr::CpEdit), ACCENT)
+                    .when(!editable, |d| d.opacity(0.45))
+                    .when(editable, |d| d.on_click(cx.listener(move |this, _, window, cx| {
+                        let rule = this.cleanup_panel.settings.as_ref().ok().and_then(|s| s.rules.iter().find(|r| r.id == edit_id)).cloned();
+                        if let Some(rule) = rule { this.edit_panel_rule(rule, None, window, cx); }
+                    }))))
+                .child(button("managed-rule-delete", t!(Tr::CpDeleteRule)).text_color(rgb(DANGER))
+                    .when(!editable, |d| d.opacity(0.45))
+                    .when(editable, |d| d.on_click(cx.listener(move |this, _, window, cx| {
+                        if this.cleanup_panel.editor.is_some() { return }
+                        let Ok(mut next) = this.cleanup_panel.settings.clone() else { return };
+                        if !next.rules.iter().any(|rule| rule.id == delete_id) { return }
+                        next.rules.retain(|rule| rule.id != delete_id);
+                        this.confirm_panel_settings(next, t!(Tr::CpConfirmDeleteRule), t!(Tr::CpDeleteRuleNote), window, cx);
+                    })))));
+        }
+        Some(div().debug_selector(|| "rule-detail-panel".into()).w(px(360.)).flex_none().min_h_0().min_w_0().border_l_1().border_color(rgb(BORDER)).bg(rgb(PANEL))
+            .flex().flex_col()
+            .child(row().flex_none().p_4().border_b_1().border_color(rgb(BORDER)).justify_between()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .when(p.editor.is_none(), |d| d.child(button("close-rule-detail", "×").tooltip(tooltip(t!(Tr::CpRulesCloseDetail)))
+                    .on_click(cx.listener(|this, _, _, cx| { this.cleanup_panel.rule_selected = None; cx.notify(); })))))
+            .child(body)
+            .when(p.editor.is_some(), |d| d.child(
+                row().debug_selector(|| "rule-editor-actions".into()).flex_none().p_3().border_t_1().border_color(rgb(BORDER))
+                    .child(primary_button("save-rule", t!(Tr::CpSaveRule), ACCENT)
+                        .when(!p.writable(), |d| d.opacity(0.45))
+                        .when(p.writable(), |d| d.on_click(cx.listener(|this, _, window, cx| this.save_panel_rule(window, cx)))))
+                    .child(button("cancel-rule", t!(Tr::CpCancelEdit))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.cleanup_panel.editor = None;
+                            cx.notify();
+                        }))),
+            )))
+    }
+
+    fn render_rule_editor(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = &self.cleanup_panel;
+        let mut view = div().flex().flex_col().gap_4().min_w_0();
         if let Some(editor) = &p.editor {
             view = view.child(
-                panel_card()
-                    .child(t!(Tr::CpEditorHint))
+                div().flex().flex_col().gap_4().min_w_0()
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpEditorHint)))
                     .when(editor_conflict(editor.open_revision, p.revision) || editor.draft_token.is_some_and(|token| !self.cleanup_current(token)), |d| d.child(div().text_color(rgb(WARNING)).child(t!(Tr::CpEditorStaleWarning))))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(t!(Tr::CpRulesMetadata)))
                     .child(field(t!(Tr::CpFieldName), &editor.name))
                     .child(field(t!(Tr::CpFieldDescription), &editor.description))
+                    .child(div().pt_3().border_t_1().border_color(rgb(BORDER)).font_weight(FontWeight::MEDIUM).child(t!(Tr::CpRulesConditions)))
                     .child(field(t!(Tr::CpFieldScopePaths), &editor.roots))
                     .child(field(t!(Tr::CpFieldMatchGlobs), &editor.pattern))
                     .child(field(t!(Tr::CpFieldExcludeGlobsShort), &editor.exclude))
-                    .child(field(t!(Tr::CpFieldMinSize), &editor.size))
-                    .child(field(t!(Tr::CpFieldKeepDaysShort), &editor.days))
+                    .child(row().items_start()
+                        .child(field(t!(Tr::CpFieldMinSize), &editor.size).flex_1())
+                        .child(field(t!(Tr::CpFieldKeepDaysShort), &editor.days).flex_1()))
                     .child(field(t!(Tr::CpFieldPriorityShort), &editor.priority))
+                    .child(div().pt_3().border_t_1().border_color(rgb(BORDER)).font_weight(FontWeight::MEDIUM).child(t!(Tr::CpRulesBehavior)))
                     .child(
                         row()
                             .child(
@@ -1641,17 +2333,7 @@ impl Petal {
                     ),
             );
             let mut categories = row();
-            for (i, category) in [
-                CleanupCategory::Temporary,
-                CleanupCategory::Cache,
-                CleanupCategory::Build,
-                CleanupCategory::Logs,
-                CleanupCategory::Downloads,
-                CleanupCategory::Backup,
-                CleanupCategory::Other,
-            ]
-            .into_iter()
-            .enumerate()
+            for (i, category) in RULE_CATEGORIES.into_iter().enumerate()
             {
                 categories = categories.child(
                     button(("edit-category", i), category_label(category))
@@ -1667,198 +2349,388 @@ impl Petal {
                         })),
                 );
             }
-            view = view.child(categories).child(
-                row()
-                    .child(button("save-rule", t!(Tr::CpSaveRule)).on_click(
-                        cx.listener(|this, _, window, cx| this.save_panel_rule(window, cx)),
-                    ))
-                    .child(button("cancel-rule", t!(Tr::CpCancelEdit)).on_click(cx.listener(
-                        |this, _, window, cx| {
-                            window.focus(&this.focus_handle, cx);
-                            this.cleanup_panel.editor = None;
-                            cx.notify();
-                        },
-                    ))),
-            );
-        }
-        let Ok(settings) = &p.settings else {
-            return view;
-        };
-        let mut ordered = settings.rules.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|r| std::cmp::Reverse(r.priority));
-        for (i, rule) in ordered.into_iter().enumerate() {
-            let edit = rule.clone();
-            let id = rule.id.clone();
-            let toggle_id = id.clone();
-            view = view.child(
-                panel_card()
-                    .child(tf!(
-                        Tr::CpRuleRowMeta,
-                        "name" => rule.name,
-                        "category" => category_label(rule.category),
-                        "source" => source_label(rule.source),
-                        "priority" => rule.priority,
-                        "days" => rule
-                            .older_than_days
-                            .map(|d| d.to_string())
-                            .unwrap_or_else(|| t!(Tr::CpNoLimit).into()),
-                        "action" => action_label(rule.action),
-                        "auto" => if rule.auto_clean {
-                            t!(Tr::CpAuthorized)
-                        } else {
-                            t!(Tr::CpOff)
-                        }
-                    ))
-                    .child(format!("{} / {}", path_list(&rule.roots), rule.pattern))
-                    .child(
-                        row()
-                            .child(
-                                button(
-                                    ("enable-rule", i),
-                                    if rule.enabled {
-                                        t!(Tr::CpEnabledOn)
-                                    } else {
-                                        t!(Tr::CpDisabledOff)
-                                    },
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        if this
-                                            .cleanup_panel
-                                            .editor
-                                            .as_ref()
-                                            .is_some_and(|editor| editor.rule.id == toggle_id)
-                                        {
-                                            this.panel_message(
-                                                t!(Tr::CpEditingLocked),
-                                                cx,
-                                            );
-                                            return;
-                                        }
-                                        let Ok(mut next) = this.cleanup_panel.settings.clone()
-                                        else {
-                                            return;
-                                        };
-                                        if let Some(r) =
-                                            next.rules.iter_mut().find(|r| r.id == toggle_id)
-                                        {
-                                            r.enabled = !r.enabled;
-                                        }
-                                        this.save_panel_settings(next, cx);
-                                    },
-                                )),
-                            )
-                            .child(button(("edit-rule", i), t!(Tr::CpEdit)).on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.edit_panel_rule(edit.clone(), None, window, cx)
-                                },
-                            )))
-                            .child(button(("delete-rule", i), t!(Tr::CpDeleteRule)).on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    let Ok(mut next) = this.cleanup_panel.settings.clone() else {
-                                        return;
-                                    };
-                                    next.rules.retain(|r| r.id != id);
-                                    this.confirm_panel_settings(
-                                        next,
-                                        t!(Tr::CpConfirmDeleteRule),
-                                        t!(Tr::CpDeleteRuleNote),
-                                        window,
-                                        cx,
-                                    );
-                                },
-                            ))),
-                    ),
-            );
+            view = view.child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpRulesCategory))).child(categories);
         }
         view
     }
-    fn render_cleanup_ai(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_cleanup_ai(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let p = &self.cleanup_panel;
         let Ok(settings) = &p.settings else {
             return panel_card();
         };
-        let mut protocols = row();
-        for (i, protocol) in [
-            AgentProtocol::ChatCompletions,
-            AgentProtocol::Responses,
-            AgentProtocol::Anthropic,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            protocols = protocols.child(
-                button(("ai-protocol", i), protocol.label())
-                    .when(settings.agent.protocol == protocol, |d| d.bg(rgb(ACCENT)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let Ok(mut next) = this.cleanup_panel.settings.clone() else {
+        let saved = text(&p.url, cx) == settings.agent.base_url
+            && text(&p.model, cx) == settings.agent.model;
+        let writable = p.writable();
+        let can_configure = writable && !p.ai_busy;
+        let can_adopt = writable && self.cleanup_ready();
+        let can_request = settings.agent.enabled && saved && self.ai_ready() && !p.ai_busy;
+        if p.chat.has_history() {
+            let mut view = div().flex().flex_col().flex_1().min_h_0().min_w_0().gap_2()
+                .child(row().flex_shrink_0().child(button("chat-analyze", t!(Tr::CpAnalyzeDisk)).when(can_request, |d| d.on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::Analyze, None, window, cx)))))
+                    .child(button("chat-explain", t!(Tr::CpExplainSelection)).when(can_request, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                        if let Screen::Results(r) = &this.screen { let ix = r.focus; this.explain_cleanup_node(ix, window, cx); }
+                    }))))
+                    .child(button("chat-generate", t!(Tr::CpGenerateDrafts)).when(can_request, |d| d.on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::GenerateRules, None, window, cx)))))
+                    .child(button("chat-config", t!(Tr::CpAiService)).on_click(cx.listener(|this, _, _, cx| { this.cleanup_panel.ai_config_expanded = !this.cleanup_panel.ai_config_expanded; cx.notify(); }))));
+            view = view.child(self.render_ai_sharing_options(can_configure, cx).flex_shrink_0());
+            if p.ai_config_expanded {
+                view = view.child(div().id("chat-config-scroll").max_h(px(240.)).overflow_y_scroll().child(self.render_cleanup_ai_config(saved, can_configure, cx)));
+            }
+            if settings.agent.has_privacy_consent() {
+                view = view.child(button("chat-reset-consent", t!(Tr::CpAiForgetConsent)).text_xs().flex_shrink_0()
+                    .when(can_configure, |d| d.on_click(cx.listener(|this, _, _, cx| this.revoke_ai_consent(false, cx)))));
+            }
+            if !p.message.is_empty() { view = view.child(div().text_xs().text_color(rgb(WARNING)).child(p.message.clone())); }
+            return view.child(self.render_chat_workspace(can_request, window.viewport_size().width < px(820.), cx));
+        }
+        let can_explain = can_request
+            && matches!(&self.screen, Screen::Results(r)
+                if r.tree.is_attached(r.focus) && r.tree.nodes[r.focus].kind != Kind::Other);
+        let response = p.response.as_ref()
+            .filter(|(token, _)| self.cleanup_current(*token))
+            .map(|(_, response)| response);
+        let (status, status_color) = if p.ai_busy {
+            (t!(Tr::CpAiStatusBusy), ACCENT)
+        } else if settings.agent.enabled {
+            (t!(Tr::CpAiStatusReady), SAFE)
+        } else {
+            (t!(Tr::CpAiStatusOff), MUTED)
+        };
+        let header = row()
+            .justify_between()
+            .gap_4()
+            .child(
+                div().flex().items_center().gap_3().min_w_0()
+                    .child(
+                        div().size(px(44.)).flex().items_center().justify_center()
+                            .rounded_xl().bg(rgba(ACCENT_TINT)).text_color(rgb(ACCENT))
+                            .font_weight(FontWeight::BOLD).child("AI"),
+                    )
+                    .child(
+                        div().flex().flex_col().gap_1().min_w_0()
+                            .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(t!(Tr::CpTabAi)))
+                            .child(div().text_color(rgb(MUTED)).child(t!(Tr::CpAiSubtitle))),
+                    ),
+            )
+            .child(row().child(ai_badge(status, status_color)).child(
+                div().max_w(px(220.)).truncate().text_xs().text_color(rgb(MUTED))
+                    .child(settings.agent.model.clone()),
+            ));
+        let mut view = div()
+            .w_full().max_w(px(1040.)).mx_auto().flex().flex_col().flex_shrink_0().gap_5().min_w_0()
+            .child(header)
+            .child(
+                div().flex().flex_col().gap_3()
+                    .child(div().font_weight(FontWeight::MEDIUM).child(t!(Tr::CpAiActions)))
+                    .child(
+                        row().items_stretch().gap_3()
+                            .child(ai_action("ai-analyze", t!(Tr::CpAnalyzeDisk), t!(Tr::CpAiAnalyzeHint), ChartType::Sunburst, can_request)
+                                .when(can_request, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_panel_ai(AgentRequest::Analyze, None, window, cx);
+                                }))))
+                            .child(ai_action("ai-explain", t!(Tr::CpExplainSelection), t!(Tr::CpAiExplainHint), ChartType::Icicle, can_explain)
+                                .when(can_explain, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                                    if let Screen::Results(r) = &this.screen {
+                                        let ix = r.focus;
+                                        this.explain_cleanup_node(ix, window, cx);
+                                    }
+                                }))))
+                            .child(ai_action("ai-drafts", t!(Tr::CpGenerateDrafts), t!(Tr::CpAiDraftsHint), ChartType::Treemap, can_request)
+                                .when(can_request, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_panel_ai(AgentRequest::GenerateRules, None, window, cx);
+                                })))),
+                    )
+                    .child(
+                        row().justify_between()
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpAiAdvisory)))
+                            .child(self.render_ai_sharing_options(can_configure, cx)),
+                    ),
+            );
+        let mut insights = ai_card().child(
+            row().justify_between()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(t!(Tr::CpAiConversation)))
+                .when(p.ai_busy || p.ai_turn.is_some() || response.is_some(), |d| d.child(
+                    button("ai-cancel", if p.ai_busy { t!(Tr::CpCancelDiscard) } else { t!(Tr::CpClearSuggestions) })
+                        .text_xs().bg(rgb(PANEL)).text_color(rgb(MUTED))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.cleanup_panel.ai_sequence = this.cleanup_panel.ai_sequence.wrapping_add(1);
+                            this.cleanup_panel.ai_busy = false;
+                            this.cleanup_panel.response = None;
+                            if this.cleanup_panel.ai_turn.as_ref().is_some_and(|turn| matches!(turn.phase, AiPhase::Consent | AiPhase::Preparing | AiPhase::Waiting)) {
+                                this.set_ai_phase(AiPhase::Cancelled, t!(Tr::CpResultCancelled), cx);
+                            } else {
+                                this.cleanup_panel.ai_turn = None;
+                                this.cleanup_panel.message.clear();
+                                cx.notify();
+                            }
+                        })),
+                )),
+        );
+        if let Some(turn) = &p.ai_turn {
+            let (phase, color) = match turn.phase {
+                AiPhase::Consent => (t!(Tr::CpAiPhaseConsent), WARNING),
+                AiPhase::Preparing => (t!(Tr::CpAiPhasePreparing), ACCENT),
+                AiPhase::Waiting => (t!(Tr::CpAiPhaseWaiting), ACCENT),
+                AiPhase::Complete => (t!(Tr::CpAiPhaseComplete), SAFE),
+                AiPhase::Failed => (t!(Tr::CpAiPhaseFailed), WARNING),
+                AiPhase::Cancelled => (t!(Tr::CpAiPhaseCancelled), MUTED),
+            };
+            insights = insights.child(
+                div().id("ai-user-message").debug_selector(|| "ai-user-message".into())
+                    .p_4().rounded_lg().bg(rgba(ACCENT_TINT)).flex().flex_col().flex_shrink_0().gap_2()
+                    .child(div().text_xs().text_color(rgb(ACCENT)).child(t!(Tr::CpAiYou)))
+                    .child(div().line_height(relative(1.5)).child(turn.request.clone())),
+            ).child(
+                div().id("ai-request-status").debug_selector(|| "ai-request-status".into())
+                    .flex().flex_col().flex_shrink_0().gap_2()
+                    .child(row().justify_between()
+                        .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(t!(Tr::CpTabAi)))
+                        .child(ai_badge(phase, color)))
+                    .when(!turn.detail.is_empty(), |d| d.child(
+                        div().text_xs().text_color(rgb(MUTED)).line_height(relative(1.5)).child(turn.detail.clone()))),
+            );
+            if let Some(answer) = &turn.answer {
+                let mut reply = div().id("ai-assistant-message").debug_selector(|| "ai-assistant-message".into())
+                    .flex().flex_col().flex_shrink_0().gap_3().min_w_0();
+                reply = reply.child(super::ai_markdown::render_markdown(answer));
+                insights = insights.child(reply);
+            }
+        } else if response.is_none() {
+            let hint = if !settings.agent.enabled {
+                t!(Tr::CpAiSetupHint)
+            } else if !saved {
+                t!(Tr::CpAiServiceHint)
+            } else if !self.ai_ready() {
+                t!(Tr::CpAiScanHint)
+            } else {
+                t!(Tr::CpAiEmptyHint)
+            };
+            insights = insights.child(
+                div().py_5().flex().flex_col().items_center().gap_2()
+                    .child(div().text_color(rgb(ACCENT)).child(icons::chart(ChartType::Sunburst)))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(t!(Tr::CpAiEmptyTitle)))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(hint)),
+            );
+        }
+        if let Some(response) = response {
+            if p.ai_turn.as_ref().and_then(|turn| turn.answer.as_ref()).is_none() {
+                let mut explanation = div().flex().flex_col().gap_3().min_w_0()
+                    .child(div().text_xs().text_color(rgb(ACCENT)).font_weight(FontWeight::MEDIUM).child(t!(Tr::CpAiResultLabel)));
+                explanation = explanation.child(super::ai_markdown::render_markdown(&response.explanation));
+                insights = insights.child(explanation);
+            }
+            if !response.proposals.is_empty() {
+                insights = insights.child(
+                    div().pt_4().border_t_1().border_color(rgb(BORDER)).font_weight(FontWeight::MEDIUM)
+                        .child(tf!(Tr::CpAiReviewDrafts, "count" => response.proposals.len())),
+                );
+            }
+            for (i, rule) in response.proposals.iter().enumerate() {
+                let edit = rule.clone();
+                let edit_id = rule.id.clone();
+                let adopt = rule.id.clone();
+                let enable = rule.id.clone();
+                let reject = rule.id.clone();
+                let retention = rule.older_than_days
+                    .map(|days| tf!(Tr::CpAiDraftRetention, "days" => days))
+                    .unwrap_or_else(|| t!(Tr::CpDraftNoLimit).into());
+                insights = insights.child(
+                    div().p_4().rounded_lg().bg(rgb(BG)).border_1().border_color(rgb(BORDER))
+                        .flex().flex_col().flex_shrink_0().gap_3().min_w_0()
+                        .child(row().justify_between()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(rule.name.clone()))
+                            .child(row().child(ai_badge(category_label(rule.category), MUTED))
+                                .child(ai_badge(retention, if rule.older_than_days.is_some() { MUTED } else { WARNING }))))
+                        .child(div().text_color(rgb(MUTED)).line_height(relative(1.5)).child(rule.description.clone()))
+                        .child(div().flex().flex_col().gap_2().text_xs().min_w_0()
+                            .child(div().text_color(rgb(MUTED)).child(t!(Tr::CpAiDraftScope)))
+                            .child(div().min_w_0().child(path_list(&rule.roots)))
+                            .child(div().text_color(rgb(MUTED)).child(t!(Tr::CpAiDraftPattern)))
+                            .child(div().min_w_0().child(rule.pattern.clone())))
+                        .child(div().text_xs().text_color(rgb(WARNING)).line_height(relative(1.5)).child(t!(Tr::CpAiDraftSafety)))
+                        .child(row().pt_2()
+                            .child(button(("draft-adopt", i), t!(Tr::CpAdoptDisabled))
+                                .text_color(rgb(ACCENT)).when(!can_adopt, |d| d.opacity(0.45))
+                                .when(can_adopt, |d| d.on_click(cx.listener(move |this, _, window, cx| {
+                                    window.focus(&this.focus_handle, cx);
+                                    this.adopt_panel_draft(adopt.clone(), false, cx);
+                                }))))
+                            .child(button(("draft-enable", i), t!(Tr::CpAdoptEnable))
+                                .when(!can_adopt, |d| d.opacity(0.45))
+                                .when(can_adopt, |d| d.on_click(cx.listener(move |this, _, window, cx| {
+                                    window.focus(&this.focus_handle, cx);
+                                    this.adopt_panel_draft(enable.clone(), true, cx);
+                                }))))
+                            .child(button(("draft-edit", i), t!(Tr::CpEditAsUserRule))
+                                .when(!can_adopt, |d| d.opacity(0.45))
+                                .when(can_adopt, |d| d.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit_panel_rule(edit.clone(), Some(edit_id.clone()), window, cx);
+                                }))))
+                            .child(button(("draft-reject", i), t!(Tr::CpReject)).text_color(rgb(MUTED))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    window.focus(&this.focus_handle, cx);
+                                    if let Some((_, response)) = &mut this.cleanup_panel.response {
+                                        response.proposals.retain(|r| r.id != reject);
+                                    }
+                                    cx.notify();
+                                })))),
+                );
+            }
+        }
+        if p.chat.selected.is_some() || !p.chat.archive.sessions.is_empty() {
+            view = view.child(self.render_chat_workspace(can_request, window.viewport_size().width < px(820.), cx));
+        } else {
+            view = view.child(self.render_chat_controls(can_request, cx)).child(insights);
+        }
+        if !p.message.is_empty() {
+            view = view.child(
+                div().px_4().py_3().rounded_lg().bg(rgba(ACCENT_TINT)).border_1().border_color(rgb(BORDER))
+                    .text_xs().line_height(relative(1.5)).child(p.message.clone()),
+            );
+        }
+        let expanded = p.ai_config_expanded;
+        let mut service = ai_card().p_0().gap_0().child(
+            div().id("ai-config-toggle").p_4().flex().flex_wrap().items_center().justify_between().gap_3()
+                .cursor_pointer().rounded_xl().hover(|s| s.bg(rgb(CARD)))
+                .child(row().child(div().text_color(rgb(MUTED)).child(if expanded { "⌄" } else { "›" }))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(t!(Tr::CpAiService)))
+                    .child(ai_badge(if saved { t!(Tr::CpAiSaved) } else { t!(Tr::CpAiUnsaved) }, if saved { MUTED } else { WARNING })))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(settings.agent.protocol.label()))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    this.cleanup_panel.ai_config_expanded = !this.cleanup_panel.ai_config_expanded;
+                    cx.notify();
+                })),
+        );
+        if expanded {
+            service = service.child(self.render_cleanup_ai_config(saved, can_configure, cx));
+        }
+        if settings.agent.has_privacy_consent() {
+            service = service.child(
+                row().px_4().pb_3()
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpAiConsentRemembered)))
+                    .child(button("ai-reset-consent", t!(Tr::CpAiForgetConsent)).text_xs()
+                        .when(!can_configure, |d| d.opacity(0.45))
+                        .when(can_configure, |d| d.on_click(cx.listener(|this, _, _, cx| {
+                            this.revoke_ai_consent(false, cx);
+                        })))),
+            );
+        }
+        view.child(service).child(
+            div().text_xs().text_color(rgb(MUTED)).line_height(relative(1.5)).child(t!(Tr::CpAiIntro)),
+        )
+    }
+
+    fn render_ai_sharing_options(&self, can_configure: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let Ok(settings) = &self.cleanup_panel.settings else { return div() };
+        row()
+            .child(ai_option("ai-paths", if settings.agent.share_paths { t!(Tr::CpAiPathsShared) } else { t!(Tr::CpAiPathsHidden) }, settings.agent.share_paths, can_configure, WARNING)
+                .debug_selector(|| "ai-paths".into())
+                .tooltip(tooltip(t!(Tr::CpFullPathsExplain)))
+                .when(can_configure, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                    let Ok(mut next) = this.cleanup_panel.settings.clone() else { return };
+                    next.agent.share_paths = !next.agent.share_paths;
+                    if next.agent.share_paths {
+                        if let Err(error) = next.agent.remember_privacy_consent() {
+                            this.panel_message(error, cx);
                             return;
-                        };
+                        }
+                        this.confirm_panel_settings(next, t!(Tr::CpAllowFullPaths), t!(Tr::CpFullPathsExplain), window, cx);
+                    } else {
+                        this.save_panel_settings(next, cx);
+                    }
+                }))))
+            .child(ai_option("ai-thinking", t!(Tr::CpAiThinking), settings.agent.thinking, can_configure, ACCENT)
+                .debug_selector(|| "ai-thinking".into())
+                .tooltip(tooltip(t!(Tr::CpAiThinkingHint)))
+                .when(can_configure, |d| d.on_click(cx.listener(|this, _, _, cx| {
+                    let Ok(mut next) = this.cleanup_panel.settings.clone() else { return };
+                    next.agent.thinking = !next.agent.thinking;
+                    this.save_panel_settings(next, cx);
+                }))))
+    }
+
+    fn render_cleanup_ai_config(&self, saved: bool, can_configure: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let p = &self.cleanup_panel;
+        let Ok(settings) = &p.settings else { return div() };
+        let mut protocols = row().p_1().rounded_lg().bg(rgb(BG));
+        for (i, protocol) in [AgentProtocol::ChatCompletions, AgentProtocol::Responses, AgentProtocol::Anthropic].into_iter().enumerate() {
+            protocols = protocols.child(
+                button(("ai-protocol", i), protocol.label()).text_xs().border_color(rgb(BG)).bg(rgb(BG))
+                    .when(settings.agent.protocol == protocol, |d| d.bg(rgb(CARD)).border_color(rgb(BORDER)).text_color(rgb(ACCENT)))
+                    .when(!can_configure, |d| d.opacity(0.45))
+                    .when(can_configure, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                        let Ok(mut next) = this.cleanup_panel.settings.clone() else { return };
                         next.agent.protocol = protocol;
                         next.agent.base_url = text(&this.cleanup_panel.url, cx);
                         next.agent.model = text(&this.cleanup_panel.model, cx);
                         this.save_panel_settings(next, cx);
-                    })),
+                    }))),
             );
         }
         let credential_target = match self.panel_credential_target(cx) {
             Ok(scope) => tf!(Tr::CpCurrentKeyTarget, "scope" => scope),
             Err(e) => tf!(Tr::CpKeyTargetUnavailable, "e" => e),
         };
-        let mut view = panel_card().child(t!(Tr::CpAiIntro))
-            .child(credential_target)
-            .child(protocols).child(field(t!(Tr::CpFieldEndpoint), &p.url)).child(field(t!(Tr::CpFieldModelShort), &p.model)).child(field(t!(Tr::CpFieldApiKey), &p.key))
-            .child(row().child(button("ai-save", t!(Tr::CpSaveAiConfig)).on_click(cx.listener(|this, _, _, cx| this.save_panel_ai(cx))))
-                .child(button("ai-key-save", if p.key_busy { t!(Tr::CpKeychainBusy) } else { t!(Tr::CpSaveKey) }).on_click(cx.listener(|this, _, _, cx| this.store_panel_key(false, cx))))
-                .child(button("ai-key-delete", t!(Tr::CpDeleteKey)).on_click(cx.listener(|this, _, window, cx| {
-                    this.confirm_panel_key_delete(window, cx);
-                })))
-                .child(button("ai-test", if p.test_busy { t!(Tr::CpTesting) } else { t!(Tr::CpTestConnection) }).on_click(cx.listener(|this, _, window, cx| {
-                    this.test_panel_connection(window, cx);
-                }))))
-            .child(row().child(button("ai-enable", if settings.agent.enabled { t!(Tr::CpAiEnabled) } else { t!(Tr::CpAiConsent) }).on_click(cx.listener(|this, _, window, cx| {
-                let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; next.agent.enabled = !next.agent.enabled;
-                if next.agent.enabled { let detail = tf!(Tr::CpAiEnabledExplain, "target" => next.agent.base_url, "model" => next.agent.model); this.confirm_panel_settings(next, t!(Tr::CpConsentSendMetadata), &detail, window, cx); }
-                else { this.save_panel_settings(next, cx); }
-            }))).child(button("ai-paths", if settings.agent.share_paths { t!(Tr::CpPathsOn) } else { t!(Tr::CpPathsOff) }).on_click(cx.listener(|this, _, window, cx| {
-                let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; next.agent.share_paths = !next.agent.share_paths;
-                if next.agent.share_paths { this.confirm_panel_settings(next, t!(Tr::CpAllowFullPaths), t!(Tr::CpFullPathsExplain), window, cx); }
-                else { this.save_panel_settings(next, cx); }
-            }))).child(button("ai-thinking", if settings.agent.thinking { t!(Tr::CpThinkingOn) } else { t!(Tr::CpThinkingOff) }).on_click(cx.listener(|this, _, _, cx| {
-                let Ok(mut next) = this.cleanup_panel.settings.clone() else { return }; next.agent.thinking = !next.agent.thinking;
-                this.save_panel_settings(next, cx);
-            }))))
-            .child(row().child(button("ai-analyze", t!(Tr::CpAnalyzeDisk)).on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::Analyze, None, window, cx))))
-                .child(button("ai-explain", t!(Tr::CpExplainSelection)).on_click(cx.listener(|this, _, window, cx| {
-                    if let Screen::Results(r) = &this.screen { let ix = r.focus; this.explain_cleanup_node(ix, window, cx); }
-                }))).child(button("ai-drafts", t!(Tr::CpGenerateDrafts)).on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::GenerateRules, None, window, cx))))
-                .child(button("ai-cancel", if p.ai_busy { t!(Tr::CpCancelDiscard) } else { t!(Tr::CpClearSuggestions) }).on_click(cx.listener(|this, _, window, cx| {
-                    window.focus(&this.focus_handle, cx);
-                    this.cleanup_panel.ai_sequence = this.cleanup_panel.ai_sequence.wrapping_add(1); this.cleanup_panel.ai_busy = false; this.cleanup_panel.response = None;
-                    this.panel_message(t!(Tr::CpResultCancelled), cx);
-                }))));
-        if let Some((token, response)) = &p.response {
-            if self.cleanup_current(*token) {
-                view = view.child(response.explanation.clone());
-                for (i, rule) in response.proposals.iter().enumerate() {
-                    let edit = rule.clone();
-                    let edit_id = rule.id.clone();
-                    let adopt = rule.id.clone();
-                    let enable = rule.id.clone();
-                    let reject = rule.id.clone();
-                    view = view.child(panel_card().child(tf!(Tr::CpDraftMeta, "name" => rule.name, "category" => category_label(rule.category), "days" => rule.older_than_days.map(|d| d.to_string()).unwrap_or_else(|| t!(Tr::CpDraftNoLimit).into())))
-                        .child(tf!(Tr::CpDraftExplain, "roots" => path_list(&rule.roots), "pattern" => rule.pattern, "blurb" => rule.description))
-                        .child(row().child(button(("draft-adopt", i), t!(Tr::CpAdoptDisabled)).on_click(cx.listener(move |this, _, window, cx| { window.focus(&this.focus_handle, cx); this.adopt_panel_draft(adopt.clone(), false, cx); })))
-                            .child(button(("draft-enable", i), t!(Tr::CpAdoptEnable)).on_click(cx.listener(move |this, _, window, cx| { window.focus(&this.focus_handle, cx); this.adopt_panel_draft(enable.clone(), true, cx); })))
-                            .child(button(("draft-edit", i), t!(Tr::CpEditAsUserRule)).on_click(cx.listener(move |this, _, window, cx| this.edit_panel_rule(edit.clone(), Some(edit_id.clone()), window, cx))))
-                            .child(button(("draft-reject", i), t!(Tr::CpReject)).on_click(cx.listener(move |this, _, window, cx| {
-                                window.focus(&this.focus_handle, cx);
-                                if let Some((_, response)) = &mut this.cleanup_panel.response { response.proposals.retain(|r| r.id != reject); } cx.notify();
-                            })))));
-                }
-            }
-        }
-        view
+        let can_use_key = can_configure && self.panel_credential_target(cx).is_ok();
+        let can_save_key = can_use_key && !text(&p.key, cx).is_empty();
+        div().p_5().pt_4().border_t_1().border_color(rgb(BORDER)).flex().flex_col().gap_4().min_w_0()
+            .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpAiServiceHint)))
+            .child(div().flex().flex_col().gap_2()
+                .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpAiProtocol))).child(protocols))
+            .child(row().items_start().gap_4()
+                .child(field(t!(Tr::CpFieldEndpoint), &p.url).flex_1().flex_basis(px(360.)))
+                .child(field(t!(Tr::CpFieldModelShort), &p.model).flex_1().flex_basis(px(220.))))
+            .child(row()
+                .child(primary_button("ai-save", t!(Tr::CpSaveAiConfig), ACCENT)
+                    .when(!can_configure, |d| d.opacity(0.45))
+                    .when(can_configure, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.focus_handle, cx);
+                        this.save_panel_ai(cx);
+                    }))))
+                .child(button("ai-test", if p.test_busy { t!(Tr::CpTesting) } else { t!(Tr::CpTestConnection) })
+                    .when(!can_configure || !saved, |d| d.opacity(0.45))
+                    .when(can_configure && saved, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                        this.test_panel_connection(window, cx);
+                    })))))
+            .child(div().pt_4().border_t_1().border_color(rgb(BORDER)).flex().flex_col().gap_3().min_w_0()
+                .child(field(t!(Tr::CpFieldApiKey), &p.key))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpAiKeyHint)))
+                .child(row()
+                    .child(button("ai-key-save", if p.key_busy { t!(Tr::CpKeychainBusy) } else { t!(Tr::CpSaveKey) })
+                        .when(!can_save_key, |d| d.opacity(0.45))
+                        .when(can_save_key, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.store_panel_key(false, cx);
+                        }))))
+                    .child(button("ai-key-delete", t!(Tr::CpDeleteKey)).text_color(rgb(DANGER))
+                        .when(!can_use_key, |d| d.opacity(0.45))
+                        .when(can_use_key, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_panel_key_delete(window, cx);
+                        })))))
+                .child(div().text_xs().text_color(rgb(MUTED)).line_height(relative(1.5)).child(credential_target)))
+            .child(div().pt_4().border_t_1().border_color(rgb(BORDER)).flex().flex_wrap().items_center().justify_between().gap_3()
+                .child(ai_badge(if settings.agent.enabled { t!(Tr::CpAiStatusReady) } else { t!(Tr::CpAiStatusOff) }, if settings.agent.enabled { SAFE } else { MUTED }))
+                .child(button("ai-enable", if settings.agent.enabled { t!(Tr::CpAiEnabled) } else { t!(Tr::CpAiConsent) })
+                    .text_color(rgb(ACCENT))
+                    .when(!can_configure || (!settings.agent.enabled && !saved), |d| d.opacity(0.45))
+                    .when(can_configure && (settings.agent.enabled || saved), |d| d.on_click(cx.listener(|this, _, window, cx| {
+                        let Ok(mut next) = this.cleanup_panel.settings.clone() else { return };
+                        next.agent.enabled = !next.agent.enabled;
+                        if next.agent.enabled {
+                            let detail = tf!(Tr::CpAiEnabledExplain, "target" => next.agent.base_url, "model" => next.agent.model,
+                                "protocol" => next.agent.protocol.label(),
+                                "paths" => if next.agent.share_paths { t!(Tr::CpPathsFull) } else { t!(Tr::CpPathsOpaque) });
+                            if let Err(error) = next.agent.remember_privacy_consent() {
+                                this.panel_message(error, cx);
+                                return;
+                            }
+                            this.confirm_panel_settings(next, t!(Tr::CpConsentSendMetadata), &detail, window, cx);
+                        } else {
+                            this.revoke_ai_consent(true, cx);
+                        }
+                    })))))
     }
     fn render_cleanup_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = &self.cleanup_panel;
@@ -1957,6 +2829,242 @@ impl Petal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_snapshot_survives_live_generation_but_not_scan_or_config_changes() {
+        let captured = Token { scan: 4, revision: 2, generation: 1 };
+        assert!(ai_snapshot_current(captured, Token { generation: 90, ..captured }));
+        assert!(!ai_snapshot_current(captured, Token { scan: 5, ..captured }));
+        assert!(!ai_snapshot_current(captured, Token { revision: 3, ..captured }));
+        assert!(captured != Token { generation: 90, ..captured }, "cleanup drafts still require the full token");
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn ai_conversation_remains_visible_during_live_refresh(cx: &mut gpui::TestAppContext) {
+        // No configuration reads/writes, timers, Keychain or network requests.
+        let window = cx.open_window(gpui::size(px(1240.), px(800.)), |window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            let mut panel = PanelState::with_settings(Ok(Settings::default()), cx);
+            panel.open = true;
+            panel.tab = 2;
+            panel.ai_busy = true;
+            panel.ai_sequence = 7;
+            panel.ai_turn = Some(AiTurn {
+                request: "Explain example-cache".into(), phase: AiPhase::Waiting,
+                detail: "Waiting for response".into(), answer: None,
+            });
+            Petal {
+                screen: Screen::Start(vec![]), cleanup_panel: panel, focus_handle,
+                error: None, notice: None, notice_warning: false, notice_version: 0,
+                access: Access::Dismissed, _access_watch: None,
+                color_by: ColorBy::Folder, chart: ChartType::Sunburst,
+            }
+        });
+        let view = window.root(cx).unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let initial = visual.debug_bounds("ai-user-message").expect("request is visible immediately");
+        assert!(initial.top() >= px(0.));
+        let status = visual.debug_bounds("ai-request-status").expect("waiting state is visible");
+        for _ in 0..5 {
+            view.update(&mut visual, |this, cx| {
+                this.cleanup_panel.preview_busy = true;
+                this.invalidate_scan_cleanup_jobs();
+                assert!(this.cleanup_panel.ai_busy);
+                assert_eq!(this.cleanup_panel.ai_sequence, 7);
+                assert!(!this.cleanup_panel.preview_busy);
+                assert!(this.cleanup_panel.ai_turn.as_ref().unwrap().phase == AiPhase::Waiting);
+                cx.notify();
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(visual.debug_bounds("ai-user-message").unwrap(), initial);
+            assert_eq!(visual.debug_bounds("ai-request-status").unwrap(), status);
+        }
+        view.update(&mut visual, |this, cx| {
+            let turn = this.cleanup_panel.ai_turn.as_mut().unwrap();
+            turn.phase = AiPhase::Complete;
+            turn.answer = Some("A read-only explanation.\n\n".repeat(30));
+            this.cleanup_panel.ai_busy = false;
+            this.invalidate_scan_cleanup_jobs();
+            assert!(this.cleanup_panel.ai_turn.as_ref().unwrap().answer.is_some());
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("ai-assistant-message").is_some());
+        view.read_with(&visual, |this, _| {
+            assert!(this.cleanup_panel.ai_scroll.max_offset().y > px(0.), "long replies remain scrollable");
+        });
+        view.update(&mut visual, |this, cx| {
+            this.cleanup_panel.ai_busy = true;
+            this.cleanup_panel.ai_turn.as_mut().unwrap().phase = AiPhase::Waiting;
+            this.invalidate_cleanup_jobs();
+            assert!(!this.cleanup_panel.ai_busy);
+            assert_eq!(this.cleanup_panel.ai_sequence, 8);
+            assert!(this.cleanup_panel.ai_turn.as_ref().unwrap().phase == AiPhase::Cancelled);
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("ai-request-status").is_some(), "cancellation is explicit, not an empty card");
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| this.request_panel_ai(AgentRequest::Analyze, None, window, cx));
+        });
+        view.read_with(&visual, |this, _| {
+            assert!(this.cleanup_panel.ai_turn.as_ref().unwrap().phase == AiPhase::Failed);
+            assert!(!this.cleanup_panel.ai_turn.as_ref().unwrap().detail.is_empty());
+        });
+    }
+
+    fn indexed_rule(id: &str, name: &str, priority: i32) -> Rule {
+        Rule {
+            id: id.into(), name: name.into(), description: "Cache files for local builds".into(),
+            category: CleanupCategory::Cache, roots: vec![PathBuf::from("~/Library/Caches/Example")],
+            pattern: "**/*.tmp".into(), exclude: vec!["**/keep/**".into()], min_size: 0,
+            older_than_days: Some(30), priority, enabled: true, auto_clean: false,
+            action: CleanupAction::Trash, source: RuleSource::User,
+        }
+    }
+
+    #[test]
+    fn rule_index_combines_search_source_category_and_status() {
+        let mut rules = vec![indexed_rule("a", "Build CACHE", 5), indexed_rule("b", "Build cache", 8)];
+        rules[0].auto_clean = true;
+        rules[1].source = RuleSource::BuiltIn;
+        let mut index = RuleIndex::default();
+        let query = RuleQuery {
+            search: "cache example *.tmp keep".into(), status: RuleStatusFilter::Automatic,
+            source: Some(RuleSource::User), category: Some(CleanupCategory::Cache),
+            ..Default::default()
+        };
+        assert_eq!(&*index.visible(&rules, 0, query.clone()), &[0]);
+        assert!(index.visible(&rules, 0, RuleQuery { category: Some(CleanupCategory::Logs), ..query.clone() }).is_empty());
+        assert!(index.visible(&rules, 0, RuleQuery { source: Some(RuleSource::Ai), ..query }).is_empty());
+        rules[0].enabled = false;
+        assert_eq!(&*index.visible(&rules, 1, RuleQuery { status: RuleStatusFilter::Disabled, ..Default::default() }), &[0]);
+        assert!(index.visible(&rules, 1, RuleQuery { status: RuleStatusFilter::Automatic, ..Default::default() }).is_empty());
+        assert!(index.visible(&rules, 1, RuleQuery { search: "does-not-exist".into(), ..Default::default() }).is_empty());
+    }
+
+    #[test]
+    fn rule_index_sorts_stably_and_reuses_results_between_frames() {
+        let rules = vec![indexed_rule("z", "Same", 10), indexed_rule("a", "Same", 10), indexed_rule("b", "Alpha", -2)];
+        let mut index = RuleIndex::default();
+        let first = index.visible(&rules, 0, RuleQuery::default());
+        assert_eq!(&*first, &[1, 0, 2]);
+        assert!(Rc::ptr_eq(&first, &index.visible(&rules, 0, RuleQuery::default())));
+        assert_eq!(&*index.visible(&rules, 0, RuleQuery { sort: RuleSort::Name, ..Default::default() }), &[2, 1, 0]);
+        let mut changed = rules;
+        changed[1].enabled = false;
+        assert_eq!(&*index.visible(&changed, 1, RuleQuery { sort: RuleSort::Status, ..Default::default() }), &[0, 2, 1]);
+        assert_eq!(index.enabled, 2);
+    }
+
+    #[test]
+    fn rule_index_retains_thousands_and_refreshes_after_reload_or_deletion() {
+        let mut rules: Vec<_> = (0..5000).map(|i| indexed_rule(&format!("rule-{i}"), &format!("Rule {i}"), i)).collect();
+        let mut index = RuleIndex::default();
+        let all = index.visible(&rules, 0, RuleQuery::default());
+        assert_eq!(all.len(), 5000);
+        assert_eq!(all[0], 4999);
+        assert_eq!(all[4999], 0);
+        assert_eq!(index.rule(&rules, "rule-4999").unwrap().priority, 4999);
+        assert!(index.rule(&rules, "missing").is_none());
+        let query = RuleQuery { search: "rule-4999".into(), ..Default::default() };
+        assert_eq!(&*index.visible(&rules, 0, query.clone()), &[4999]);
+        rules.pop();
+        assert!(index.visible(&rules, 1, query).is_empty());
+        assert!(index.rule(&rules, "rule-4999").is_none());
+        rules.swap(0, 4998);
+        index.visible(&rules, 2, RuleQuery::default());
+        assert_eq!(index.rule(&rules, "rule-0").unwrap().priority, 0);
+        assert_eq!(index.rule(&rules, "rule-4998").unwrap().priority, 4998);
+        let updated = index.visible(&rules, 2, RuleQuery::default());
+        assert_eq!(updated.len(), 4999);
+        assert_eq!(rules[updated[0]].id, "rule-4998");
+        assert!(index.visible(&[], 3, RuleQuery::default()).is_empty());
+        assert!(index.by_id.is_empty());
+        assert_eq!(index.enabled, 0);
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn rule_workspace_virtualizes_and_keeps_detail_usable(cx: &mut gpui::TestAppContext) {
+        // A real GPUI layout, with no scan, timers, network or configuration writes.
+        let window = cx.open_window(gpui::size(px(1240.), px(800.)), |window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            let mut cleanup_panel = PanelState::with_settings(Ok(Settings::default()), cx);
+            cleanup_panel.open = true;
+            cleanup_panel.tab = 1;
+            cleanup_panel.settings = Ok(Settings {
+                rules: (0..5000).map(|i| indexed_rule(&format!("rule-{i}"), &format!("Cache rule {i}"), i)).collect(),
+                ..Settings::default()
+            });
+            Petal {
+                screen: Screen::Start(vec![]), cleanup_panel, focus_handle,
+                error: None, notice: None, notice_warning: false, notice_version: 0,
+                access: Access::Dismissed, _access_watch: None,
+                color_by: ColorBy::Folder, chart: ChartType::Sunburst,
+            }
+        });
+        let view = window.root(cx).unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let draw = |visual: &mut gpui::VisualTestContext| {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        draw(&mut visual);
+        let first = visual.debug_bounds("rule-row-rule-4999").expect("highest priority row is visible");
+        assert_eq!(first.size.height, px(RULE_ROW_HEIGHT));
+        assert!(visual.debug_bounds("rule-row-rule-0").is_none(), "off-screen rules must not be rendered");
+        visual.simulate_click(first.center(), gpui::Modifiers::default());
+        draw(&mut visual);
+        view.read_with(&visual, |this, _| assert_eq!(this.cleanup_panel.rule_selected.as_deref(), Some("rule-4999")));
+        let detail = visual.debug_bounds("rule-detail-panel").expect("row click opens details");
+        let table = visual.debug_bounds("rules-table").unwrap();
+        assert!(table.right() <= detail.left());
+        assert_eq!(detail.size.width, px(360.));
+        visual.simulate_resize(gpui::size(px(860.), px(560.)));
+        draw(&mut visual);
+        let detail = visual.debug_bounds("rule-detail-panel").unwrap();
+        assert!(detail.right() <= px(860.));
+        assert!(visual.debug_bounds("rule-name-cell").unwrap().size.width > px(200.), "compact columns must leave room for names");
+        view.update(&mut visual, |this, cx| {
+            this.cleanup_panel.rule_scroll.scroll_to_item(4999, ScrollStrategy::Top);
+            cx.notify();
+        });
+        draw(&mut visual);
+        let last = visual.debug_bounds("rule-row-rule-0").expect("last of 5000 rules remains reachable");
+        visual.simulate_click(last.center(), gpui::Modifiers::default());
+        draw(&mut visual);
+        view.read_with(&visual, |this, _| assert_eq!(this.cleanup_panel.rule_selected.as_deref(), Some("rule-0")));
+        view.update(&mut visual, |this, cx| {
+            this.cleanup_panel.rule_search.update(cx, |input, cx| input.set_text("rule-1234", cx));
+        });
+        draw(&mut visual);
+        let filtered = visual.debug_bounds("rule-row-rule-1234").expect("search resets scroll and reveals matching rule");
+        visual.simulate_click(filtered.center(), gpui::Modifiers::default());
+        draw(&mut visual);
+        view.read_with(&visual, |this, _| assert_eq!(this.cleanup_panel.rule_selected.as_deref(), Some("rule-1234")));
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                let rule = this.cleanup_panel.settings.as_ref().unwrap().rules[1234].clone();
+                this.edit_panel_rule(rule, None, window, cx);
+            });
+        });
+        draw(&mut visual);
+        let actions = visual.debug_bounds("rule-editor-actions").expect("editor actions remain visible");
+        let detail = visual.debug_bounds("rule-detail-panel").unwrap();
+        assert!(actions.bottom() <= detail.bottom());
+        assert!(actions.top() >= detail.top());
+        visual.update(|window, cx| {
+            view.read_with(cx, |this, cx| {
+                assert_eq!(this.cleanup_panel.rule_editor_scroll.offset().y, px(0.));
+                assert!(this.cleanup_panel.editor.as_ref().unwrap().name.read(cx).focus_handle().is_focused(window));
+            });
+        });
+    }
+
     #[test]
     fn editor_rejects_any_changed_settings_revision() {
         assert!(!editor_conflict(9, 9));

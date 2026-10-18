@@ -17,6 +17,7 @@ gpui_platform = { git = "https://github.com/gpui-ce/gpui-ce", rev = "98e9aacd9be
 rayon = "1.10"
 libc = "0.2"
 palette = "0.7"
+pulldown-cmark = "0.13"
 trash = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

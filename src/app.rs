@@ -37,6 +37,8 @@ use crate::watch;
 
 #[path = "app/cleanup_panel.rs"]
 mod cleanup_panel;
+#[path = "app/ai_markdown.rs"]
+mod ai_markdown;
 
 actions!(petal, [GoUp, OpenFolder, Rescan, StartOver, ShowSunburst, ShowIcicle, ShowTreemap, ReadAsAdmin]);
 
@@ -788,6 +790,7 @@ impl Petal {
             color_by: ColorBy::Folder,
             chart: ChartType::Sunburst,
         };
+        this.install_chat_shutdown(window, cx);
         this.start_cleanup_scheduler(cx);
         if access == Access::Missing {
             this._access_watch = Some(this.watch_access(cx));
@@ -1050,6 +1053,9 @@ impl Petal {
     /// Read changed folders again in the background. Returns false once these results are gone.
     fn check_changes(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
         if self.cleanup_panel.executing() { return true; }
+        let eligible_state = std::env::var_os("HOME").and_then(|home| {
+            watch::eligible_state_dir(&onboarding::state_dir()?, &PathBuf::from(home))
+        });
         let Some(r) = self.results() else { return false };
         if r.id != id {
             return false;
@@ -1067,6 +1073,9 @@ impl Petal {
         let mut folders: HashMap<usize, bool> = HashMap::new();
         for change in pending.changes {
             if let Some(ix) = r.tree.changed_folder(&change.path) {
+                if watch::is_private_state_change(&change, eligible_state.as_deref(), pending.lost) {
+                    continue;
+                }
                 *folders.entry(ix).or_default() |= change.recursive;
             }
         }
@@ -1090,7 +1099,7 @@ impl Petal {
         }
         if folders.is_empty() {
             if r.out_of_date && !was_out_of_date {
-                self.invalidate_cleanup_jobs();
+                self.invalidate_scan_cleanup_jobs();
                 cx.notify();
             }
             return true;
@@ -1108,8 +1117,8 @@ impl Petal {
         let root = tree.root_path.clone();
         let startup = r.requested_root == std::path::Path::new("/");
         r.refreshing = true;
-        // Stop metadata evaluation as soon as a rescan begins, not only after splice.
-        self.invalidate_cleanup_jobs();
+        // Cleanup plans must expire immediately; read-only AI keeps its sealed snapshot.
+        self.invalidate_scan_cleanup_jobs();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let (fresh, errors, volumes) = cx
@@ -1458,7 +1467,7 @@ impl Petal {
     /// `volumes`: the startup disk as it is now, read in the background, when that's what was
     /// scanned.
     fn splice(&mut self, fresh: Vec<(usize, scan::Fresh)>, errors: u64, volumes: Option<scan::StartupVolumes>, cx: &mut Context<Self>) {
-        self.invalidate_cleanup_jobs();
+        self.invalidate_scan_cleanup_jobs();
         let Some(r) = self.results() else { return };
         let touched: Vec<usize> = fresh.iter().map(|(ix, _)| *ix).collect();
         let focus_path = path_to(&r.tree, r.focus);
@@ -1814,7 +1823,7 @@ impl Petal {
 impl Render for Petal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = if self.cleanup_panel.open {
-            self.render_cleanup_panel(cx).into_any_element()
+            self.render_cleanup_panel(window, cx).into_any_element()
         } else {
             match &self.screen {
                 Screen::Start(volumes) => self.render_start(volumes, cx).into_any_element(),

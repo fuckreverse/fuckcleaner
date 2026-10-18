@@ -60,6 +60,7 @@ pub fn bind_keys(cx: &mut App) {
 
 pub struct TextInput {
     value: String,
+    edit_revision: u64,
     placeholder: String,
     masked: bool,
     focus: FocusHandle,
@@ -91,6 +92,7 @@ impl TextInput {
         let cursor = value.len();
         Self {
             value,
+            edit_revision: 0,
             placeholder: single_line(&placeholder.into()),
             masked,
             focus: cx.focus_handle(),
@@ -107,7 +109,16 @@ impl TextInput {
         &self.value
     }
 
+    pub fn is_composing(&self) -> bool {
+        self.marked.is_some()
+    }
+
+    pub fn edit_revision(&self) -> u64 {
+        self.edit_revision
+    }
+
     pub fn set_text(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
+        self.edit_revision = self.edit_revision.wrapping_add(1);
         self.value = single_line(&value.into());
         self.cursor = self.value.len();
         self.anchor = self.cursor;
@@ -159,6 +170,7 @@ impl TextInput {
     }
 
     fn replace(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        self.edit_revision = self.edit_revision.wrapping_add(1);
         self.value.replace_range(range.clone(), text);
         self.cursor = range.start + text.len();
         self.anchor = self.cursor;
@@ -801,6 +813,41 @@ fn single_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn edit_revision_tracks_set_replace_and_ime(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(gpui::size(px(500.), px(200.)), |_, cx| {
+            TextInput::new("same", "", false, cx)
+        });
+        let input = window.root(cx).unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                assert_eq!(input.edit_revision(), 0);
+                assert!(!input.is_composing());
+                input.set_text("changed", cx);
+                input.set_text("same", cx);
+                assert_eq!(
+                    input.edit_revision(),
+                    2,
+                    "editing back to identical text is still a new revision"
+                );
+                input.replace_text_in_range(Some(0..4), "same", window, cx);
+                assert_eq!(input.edit_revision(), 3);
+                input.replace_and_mark_text_in_range(Some(0..4), "same", None, window, cx);
+                assert!(input.is_composing());
+                assert_eq!(input.edit_revision(), 4);
+                input.unmark_text(window, cx);
+                assert!(!input.is_composing());
+                input.replace_and_mark_text_in_range(None, "中文", None, window, cx);
+                assert_eq!(input.edit_revision(), 5);
+                input.replace_text_in_range(None, "中文", window, cx);
+                assert!(!input.is_composing());
+                assert_eq!(input.edit_revision(), 6);
+            });
+        });
+    }
 
     #[test]
     fn utf16_round_trips_at_every_scalar_boundary() {

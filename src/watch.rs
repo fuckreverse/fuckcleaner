@@ -28,6 +28,45 @@ pub struct Pending {
     pub lost: bool,
 }
 
+/// Only the default private state directory is eligible, never an arbitrary override.
+/// Pure lexical comparison: no filesystem, settings, or keychain access.
+pub(crate) fn eligible_state_dir(state_dir: &Path, home: &Path) -> Option<PathBuf> {
+    let home = logical_lower_path(home)?;
+    if home == Path::new("/") {
+        return None;
+    }
+    let expected = home.join("library/application support/petal");
+    (logical_lower_path(state_dir)? == expected).then_some(expected)
+}
+
+/// Ignore only precise, non-recursive events in an eligible private state directory.
+/// Lost history and coalesced recursive events may cover changes outside that directory.
+pub(crate) fn is_private_state_change(change: &Change, eligible_state: Option<&Path>, lost: bool) -> bool {
+    if lost || change.recursive {
+        return false;
+    }
+    let Some(state_dir) = eligible_state else { return false };
+    logical_lower_path(&change.path).is_some_and(|path| path.starts_with(state_dir))
+}
+
+/// Compare components, including the startup Data-volume firmlink alias. Reject unsafe
+/// raw components before `Path::components` could silently normalize away `.`.
+fn logical_lower_path(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    if !path.is_absolute()
+        || text.split('/').any(|part| part == "." || part == ".." || part.contains('\\') || part.chars().any(char::is_control))
+    {
+        return None;
+    }
+    let mut parts: Vec<String> = text.split('/').filter(|part| !part.is_empty()).map(str::to_lowercase).collect();
+    if parts.starts_with(&["system".into(), "volumes".into(), "data".into()]) {
+        parts.drain(..3);
+    }
+    let mut logical = PathBuf::from("/");
+    logical.extend(parts);
+    Some(logical)
+}
+
 /// The FSEvents position now. Note it before scanning to catch changes made during the scan.
 pub fn current_event_id() -> u64 {
     unsafe { FSEventsGetCurrentEventId() }
@@ -188,6 +227,124 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    const HOME: &str = "/Users/Sam";
+    const STATE: &str = "/Users/Sam/Library/Application Support/Petal";
+
+    fn private_change(path: &str, recursive: bool) -> Change {
+        Change { path: PathBuf::from(path), recursive }
+    }
+
+    #[test]
+    fn private_state_exact_children_alias_and_case() {
+        let state = eligible_state_dir(Path::new(STATE), Path::new(HOME)).unwrap();
+        assert_eq!(state, Path::new("/users/sam/library/application support/petal"));
+        for path in [
+            STATE,
+            "/Users/Sam/Library/Application Support/Petal/history/session.json",
+            "/System/Volumes/Data/Users/Sam/Library/Application Support/Petal/history",
+            "/SYSTEM/VOLUMES/DATA/USERS/sAM/LIBRARY/APPLICATION SUPPORT/pETAL/History",
+            "/Users/Sam/Library/Application Support/Petal/",
+        ] {
+            assert!(is_private_state_change(&private_change(path, false), Some(&state), false), "{path}");
+        }
+        for (dir, home) in [
+            ("/System/Volumes/Data/Users/Sam/Library/Application Support/Petal", HOME),
+            (STATE, "/System/Volumes/Data/Users/Sam"),
+            ("/USERS/sAM/library/application support/PETAL", "/users/SAM"),
+        ] {
+            assert_eq!(eligible_state_dir(Path::new(dir), Path::new(home)), Some(state.clone()));
+        }
+    }
+
+    #[test]
+    fn private_state_retains_parents_roots_siblings_and_other_homes() {
+        let state = eligible_state_dir(Path::new(STATE), Path::new(HOME)).unwrap();
+        for path in [
+            "/", "/System/Volumes/Data", "/Users", HOME,
+            "/Users/Sam/Library", "/Users/Sam/Library/Application Support",
+            "/Users/Sam/Library/Application Support/Petal2",
+            "/Users/Sam/Library/Application Support/PetalOther/history",
+            "/Users/SamOther/Library/Application Support/Petal",
+            "/Users/Other/Library/Application Support/Petal",
+            "/Users/Sam/Downloads", "/tmp",
+        ] {
+            assert!(!is_private_state_change(&private_change(path, false), Some(&state), false), "{path}");
+        }
+    }
+
+    #[test]
+    fn private_state_only_default_override_is_eligible() {
+        for dir in [
+            "/", "/tmp", "/Users/Sam/Downloads", "/Library/Application Support/Petal",
+            "/Users/Sam/Library/Application Support", "/Users/Sam/Library/Application Support/Petal2",
+            "/Users/Sam/Library/Application Support/Petal/child",
+            "/System/Volumes/Data/tmp", "relative/Petal",
+        ] {
+            let state = eligible_state_dir(Path::new(dir), Path::new(HOME));
+            assert!(state.is_none(), "{dir}");
+            assert!(!is_private_state_change(&private_change(dir, false), state.as_deref(), false));
+        }
+        for home in ["/", "/System/Volumes/Data", "", "relative", "/Users/../Sam", "/Users/./Sam"] {
+            assert!(eligible_state_dir(Path::new(STATE), Path::new(home)).is_none(), "{home}");
+        }
+    }
+
+    #[test]
+    fn private_state_rejects_unsafe_components() {
+        let state = eligible_state_dir(Path::new(STATE), Path::new(HOME)).unwrap();
+        for path in [
+            "/Users/Sam/Library/Application Support/Petal/../Other",
+            "/Users/Sam/Library/Application Support/Petal/./history",
+            "/Users/Sam/Library/../Library/Application Support/Petal",
+            "/System/Volumes/Data/../Data/Users/Sam/Library/Application Support/Petal",
+            "/Users/Sam/Library/Application Support/Petal/history\\other",
+            "/Users/Sam/Library/Application Support/Petal/history\u{0}",
+            "/Users/Sam/Library/Application Support/Petal/history\nother",
+            "Users/Sam/Library/Application Support/Petal",
+        ] {
+            assert!(!is_private_state_change(&private_change(path, false), Some(&state), false), "{path:?}");
+            assert!(eligible_state_dir(Path::new(path), Path::new(HOME)).is_none(), "{path:?}");
+        }
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = format!("{STATE}/").into_bytes();
+        bytes.push(0xff);
+        let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        assert!(!is_private_state_change(&Change { path, recursive: false }, Some(&state), false));
+    }
+
+    #[test]
+    fn private_state_retains_every_recursive_and_lost_event() {
+        let state = eligible_state_dir(Path::new(STATE), Path::new(HOME)).unwrap();
+        for path in [STATE, "/Users/Sam/Library/Application Support/Petal/history", "/System/Volumes/Data/Users/Sam/Library/Application Support/Petal"] {
+            assert!(!is_private_state_change(&private_change(path, true), Some(&state), false));
+            assert!(!is_private_state_change(&private_change(path, false), Some(&state), true));
+            assert!(!is_private_state_change(&private_change(path, true), Some(&state), true));
+        }
+    }
+
+    #[test]
+    fn private_state_mixed_changes_still_require_invalidation() {
+        let state = eligible_state_dir(Path::new(STATE), Path::new(HOME)).unwrap();
+        // The hook's decision after folder mapping, without UI, settings or disk access.
+        let requires_invalidation = |pending: &Pending| {
+            pending.lost || pending.changes.iter().any(|change| {
+                !is_private_state_change(change, Some(&state), pending.lost)
+            })
+        };
+        let internal = private_change(&format!("{STATE}/history"), false);
+        let mut pending = Pending { changes: vec![internal.clone()], lost: false };
+        assert!(!requires_invalidation(&pending));
+        pending.changes.push(private_change("/Users/Sam/Downloads", false));
+        assert!(requires_invalidation(&pending));
+        assert_eq!(pending.changes.len(), 2);
+        pending.changes = vec![internal];
+        pending.lost = true;
+        assert!(requires_invalidation(&pending));
+        assert!(pending.lost);
+        pending.changes.clear();
+        assert!(requires_invalidation(&pending));
+    }
 
     /// Real FSEvents: a change in a watched folder is reported for that folder.
     #[test]

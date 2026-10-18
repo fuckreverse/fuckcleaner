@@ -2,6 +2,7 @@ mod admin;
 mod agent;
 mod app;
 mod cleanup;
+mod chat_history;
 mod credentials;
 mod classify;
 mod cli;
@@ -77,13 +78,13 @@ fn main() {
     let initial = args.get(1).map(PathBuf::from).or_else(|| onboarding::is_first_run().then(|| PathBuf::from("/")));
 
     gpui_platform::application().run(move |cx: &mut App| {
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Quit, cx| request_close(cx, true));
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
         cx.on_action(|_: &Minimize, cx| with_window(cx, |window| window.minimize_window()));
         cx.on_action(|_: &Zoom, cx| with_window(cx, |window| window.zoom_window()));
-        cx.on_action(|_: &CloseWindow, cx| with_window(cx, |window| window.remove_window()));
+        cx.on_action(|_: &CloseWindow, cx| request_close(cx, false));
         text_input::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
@@ -186,6 +187,20 @@ pub fn menus(chart: ChartType) -> Vec<Menu> {
             disabled: false,
         },
     ]
+}
+
+/// Menu quit/close uses the same drain gate as the native close button.
+fn request_close(cx: &mut App, quit: bool) {
+    let handle = cx.active_window().or_else(|| cx.windows().first().copied());
+    if let Some(handle) = handle {
+        handle.update(cx, |view, window, cx| {
+            if let Ok(view) = view.downcast::<Petal>() {
+                view.update(cx, |this, cx| this.request_chat_close(quit, window, cx));
+            }
+        }).ok();
+    } else if quit {
+        cx.quit();
+    }
 }
 
 /// Run `f` on the frontmost window, if Petal has one.
