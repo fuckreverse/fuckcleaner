@@ -26,6 +26,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 security-framework = "3"
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSButton", "NSControl", "NSView", "NSColor", "NSFont", "NSFontDescriptor", "NSAttributedString", "NSCell", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSString", "NSAttributedString", "NSDictionary"] }
+
 [features]
 # Dev aid: script the window and save PNGs or record a video of it (see src/snapshot.rs).
 snapshot = ["gpui/test-support", "gpui_platform/test-support", "dep:image"]

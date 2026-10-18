@@ -76,7 +76,8 @@ impl RuleIndex {
         if self.revision != Some(revision) || self.language != language {
             // Build the text index once per settings revision, not per row or scroll frame.
             self.searchable = rules.iter().map(|rule| {
-                format!("{} {} {} {} {} {} {} {}", rule.id, rule.name, rule.description,
+                format!("{} {} {} {} {} {} {} {} {} {}", rule.id, rule.name, rule.description,
+                    rule.name_label(), rule.description_label(),
                     path_list(&rule.roots), rule.pattern, rule.exclude.join(" "),
                     category_label(rule.category), source_label(rule.source)).to_lowercase()
             }).collect();
@@ -203,6 +204,9 @@ pub(super) struct PanelState {
     key: Entity<TextInput>,
     whitelist: Entity<TextInput>,
     interval: Entity<TextInput>,
+    monitor_draft: crate::menubar::MenuBarConfig,
+    monitor_threshold: Entity<TextInput>,
+    monitor_interval: Entity<TextInput>,
     history: Vec<HistoryEntry>,
     history_busy: bool,
     history_sequence: u64,
@@ -414,6 +418,9 @@ impl PanelState {
             .ok()
             .map(|s| s.automation_interval_minutes)
             .unwrap_or(60);
+        let monitor_draft = settings.as_ref().ok().map(|s| s.menu_bar.clone()).unwrap_or_default();
+        let monitor_threshold = input(monitor_draft.threshold.to_string(), t!(Tr::MbThreshold), false, cx);
+        let monitor_interval = input(monitor_draft.refresh_seconds.to_string(), t!(Tr::MbRefreshSeconds), false, cx);
         let url = input(config.base_url, "https://api.openai.com", false, cx);
         let model = input(config.model, t!(Tr::CpFieldModel), false, cx);
         let key = input("", t!(Tr::CpFieldNewKey), true, cx);
@@ -468,6 +475,9 @@ impl PanelState {
             key,
             whitelist: input("", t!(Tr::CpFieldProtectedPaths), false, cx),
             interval: input(minutes.to_string(), t!(Tr::CpFieldInterval), false, cx),
+            monitor_draft,
+            monitor_threshold,
+            monitor_interval,
             history: vec![],
             history_busy: false,
             history_sequence: 0,
@@ -776,6 +786,56 @@ impl Petal {
         })
         .detach();
     }
+    pub(super) fn menu_bar_config(&self) -> Option<crate::menubar::MenuBarConfig> {
+        self.cleanup_panel.settings.as_ref().ok().map(|s| s.menu_bar.clone())
+    }
+
+    pub(super) fn open_monitor_settings(&mut self, cx: &mut Context<Self>) {
+        self.cleanup_panel.open = true;
+        self.cleanup_panel.tab = 3;
+        self.refresh_monitor_disks(cx);
+        cx.notify();
+    }
+
+    fn refresh_monitor_disks(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let disks = cx.background_spawn(async { crate::menubar::mounted_disks() }).await;
+            this.update(cx, |this, cx| {
+                this.menu_bar.disks = disks;
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
+
+    fn save_monitor_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.cleanup_panel.writable() { return; }
+        let Ok(mut next) = self.cleanup_panel.settings.clone() else { return; };
+        let mut config = self.cleanup_panel.monitor_draft.clone();
+        let Ok(threshold) = text(&self.cleanup_panel.monitor_threshold, cx).parse() else {
+            self.panel_message(t!(Tr::MbBadThreshold), cx); return;
+        };
+        let Ok(seconds) = text(&self.cleanup_panel.monitor_interval, cx).parse() else {
+            self.panel_message(t!(Tr::MbBadRefresh), cx); return;
+        };
+        config.threshold = threshold;
+        config.refresh_seconds = seconds;
+        if let Err(error) = config.validate() {
+            self.panel_message(error, cx); return;
+        }
+        next.menu_bar = config.clone();
+        match next.save() {
+            Ok(()) => {
+                // Presentation-only settings must not invalidate cleanup plans,
+                // consent or any running cleanup/AI operation.
+                self.cleanup_panel.settings = Ok(next);
+                self.cleanup_panel.monitor_draft = config;
+                self.menu_bar.refresh_now();
+                self.panel_message(t!(Tr::MbSaved), cx);
+            }
+            Err(error) => self.panel_message(tf!(Tr::CpSaveFailed, "e" => error), cx),
+        }
+    }
+
     fn reload_panel_settings(&mut self, cx: &mut Context<Self>) {
         if self.cleanup_panel.cleanup_busy || self.cleanup_panel.key_busy {
             return;
@@ -788,6 +848,10 @@ impl Petal {
             let url = settings.agent.base_url.clone();
             let model = settings.agent.model.clone();
             let minutes = settings.automation_interval_minutes.to_string();
+            let monitor = settings.menu_bar.clone();
+            self.cleanup_panel.monitor_threshold.update(cx, |input, cx| input.set_text(monitor.threshold.to_string(), cx));
+            self.cleanup_panel.monitor_interval.update(cx, |input, cx| input.set_text(monitor.refresh_seconds.to_string(), cx));
+            self.cleanup_panel.monitor_draft = monitor;
             self.cleanup_panel
                 .url
                 .update(cx, |input, cx| input.set_text(url, cx));
@@ -1715,6 +1779,7 @@ impl Petal {
                         window.focus(&this.focus_handle, cx);
                         this.cleanup_panel.tab = i;
                         if i == 2 { this.load_chat_archive(cx); }
+                        if i == 3 { this.refresh_monitor_disks(cx); }
                         cx.notify();
                     })),
             );
@@ -2155,7 +2220,7 @@ impl Petal {
                 .when(selected, |d| d.bg(rgba(ACCENT_TINT)))
                 .when(!selected, |d| d.hover(|s| s.bg(rgb(PANEL))))
                 .child(div().debug_selector(|| "rule-name-cell".into()).flex_1().min_w_0().flex().flex_col().gap_1()
-                    .child(div().truncate().font_weight(FontWeight::MEDIUM).child(rule.name.clone()))
+                    .child(div().truncate().font_weight(FontWeight::MEDIUM).child(rule.name_label().to_owned()))
                     .child(div().truncate().text_xs().text_color(rgb(MUTED)).child(detail)))
                 .when(!compact, |d| d
                     .child(div().w(px(76.)).flex_none().truncate().text_xs().text_color(rgb(MUTED)).child(source_label(rule.source)))
@@ -2190,9 +2255,9 @@ impl Petal {
         if p.editor.is_some() {
             body = body.child(self.render_rule_editor(cx));
         } else if let Some(rule) = rule {
-            body = body.child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(rule.name.clone()))
+            body = body.child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(rule.name_label().to_owned()))
                 .child(row().child(ai_badge(source_label(rule.source), MUTED)).child(ai_badge(category_label(rule.category), ACCENT)))
-                .child(div().line_height(relative(1.5)).text_color(rgb(MUTED)).child(if rule.description.is_empty() { t!(Tr::CpRulesNoDescription).to_owned() } else { rule.description.clone() }))
+                .child(div().line_height(relative(1.5)).text_color(rgb(MUTED)).child(if rule.description.is_empty() { t!(Tr::CpRulesNoDescription).to_owned() } else { rule.description_label().to_owned() }))
                 .child(rule_detail_field(t!(Tr::CpRulesId), rule.id.clone()))
                 .child(div().pt_3().border_t_1().border_color(rgb(BORDER)).font_weight(FontWeight::MEDIUM).child(t!(Tr::CpRulesConditions)))
                 .child(rule_detail_field(t!(Tr::CpFieldScopePaths), path_list(&rule.roots)))
@@ -2539,10 +2604,10 @@ impl Petal {
                     div().p_4().rounded_lg().bg(rgb(BG)).border_1().border_color(rgb(BORDER))
                         .flex().flex_col().flex_shrink_0().gap_3().min_w_0()
                         .child(row().justify_between()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(rule.name.clone()))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(rule.name_label().to_owned()))
                             .child(row().child(ai_badge(category_label(rule.category), MUTED))
                                 .child(ai_badge(retention, if rule.older_than_days.is_some() { MUTED } else { WARNING }))))
-                        .child(div().text_color(rgb(MUTED)).line_height(relative(1.5)).child(rule.description.clone()))
+                        .child(div().text_color(rgb(MUTED)).line_height(relative(1.5)).child(rule.description_label().to_owned()))
                         .child(div().flex().flex_col().gap_2().text_xs().min_w_0()
                             .child(div().text_color(rgb(MUTED)).child(t!(Tr::CpAiDraftScope)))
                             .child(div().min_w_0().child(path_list(&rule.roots)))
@@ -2732,6 +2797,69 @@ impl Petal {
                         }
                     })))))
     }
+    fn render_monitor_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
+        use crate::menubar::{DisplayUnit, ThresholdUnit};
+        let p = &self.cleanup_panel;
+        let draft = &p.monitor_draft;
+        let writable = p.writable();
+        let mut disks = self.menu_bar.disks.clone();
+        if !disks.iter().any(|d| d.path == PathBuf::from("/")) {
+            disks.insert(0, crate::menubar::MountedDisk { name: t!(Tr::MbStartupDisk).into(), path: PathBuf::from("/") });
+        }
+        if !disks.iter().any(|d| d.path == draft.mount) {
+            disks.push(crate::menubar::MountedDisk { name: format!("{} · {}", draft.mount.display(), t!(Tr::MbUnavailable)), path: draft.mount.clone() });
+        }
+        let mut disk_options = row();
+        for (i, disk) in disks.into_iter().enumerate() {
+            disk_options = disk_options.child(button(("monitor-disk", i), disk.name)
+                .debug_selector(move || format!("monitor-disk-{i}"))
+                .when(draft.mount == disk.path, |d| d.bg(rgb(ACCENT)))
+                .when(writable, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                    this.cleanup_panel.monitor_draft.mount = disk.path.clone(); cx.notify();
+                }))));
+        }
+        let mut display = row();
+        for (i, unit) in [DisplayUnit::Gigabytes, DisplayUnit::Terabytes, DisplayUnit::Percent, DisplayUnit::Auto].into_iter().enumerate() {
+            display = display.child(button(("monitor-unit", i), unit.label())
+                .debug_selector(move || format!("monitor-unit-{i}"))
+                .when(draft.display_unit == unit, |d| d.bg(rgb(ACCENT)))
+                .when(writable, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                    this.cleanup_panel.monitor_draft.display_unit = unit; cx.notify();
+                }))));
+        }
+        let mut threshold_units = row();
+        for (i, unit) in [ThresholdUnit::Percent, ThresholdUnit::Gigabytes].into_iter().enumerate() {
+            threshold_units = threshold_units.child(button(("monitor-threshold-unit", i), unit.label())
+                .when(draft.threshold_unit == unit, |d| d.bg(rgb(ACCENT)))
+                .when(writable, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                    this.cleanup_panel.monitor_draft.threshold_unit = unit; cx.notify();
+                }))));
+        }
+        panel_card().debug_selector(|| "monitor-settings".into()).flex_shrink_0().border_1().border_color(rgb(BORDER))
+            .child(div().font_weight(FontWeight::MEDIUM).child(t!(Tr::MbTitle)))
+            .child(ai_option("monitor-enabled", t!(Tr::MbEnabled), draft.enabled, writable, ACCENT)
+                .when(writable, |d| d.on_click(cx.listener(|this, _, _, cx| {
+                    this.cleanup_panel.monitor_draft.enabled = !this.cleanup_panel.monitor_draft.enabled; cx.notify();
+                }))))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::MbHint)))
+            .child(div().child(t!(Tr::MbDisk)).child(disk_options))
+            .child(div().child(t!(Tr::MbDisplay)).child(display))
+            .child(row().items_end()
+                .child(field(t!(Tr::MbThreshold), &p.monitor_threshold).flex_1())
+                .child(threshold_units))
+            .child(field(t!(Tr::MbRefreshSeconds), &p.monitor_interval))
+            .child(row()
+                .child(primary_button("monitor-save", t!(Tr::MbSave), ACCENT)
+                    .debug_selector(|| "monitor-save".into())
+                    .when(!writable, |d| d.opacity(0.45))
+                    .when(writable, |d| d.on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.focus_handle, cx); this.save_monitor_settings(cx);
+                    }))))
+                .child(button("monitor-refresh-disks", t!(Tr::MbRefresh)).on_click(cx.listener(|this, _, _, cx| {
+                    this.menu_bar.refresh_now(); this.refresh_monitor_disks(cx);
+                }))))
+    }
+
     fn render_cleanup_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = &self.cleanup_panel;
         let Ok(settings) = &p.settings else {
@@ -2748,6 +2876,7 @@ impl Petal {
         let mut view = panel_card()
             .child(row().child(t!(Tr::CpLanguage)).child(languages))
             .child(div().text_color(rgb(MUTED)).child(t!(Tr::CpLanguageTip)))
+            .child(self.render_monitor_settings(cx))
             .child(t!(Tr::CpAutoIntro))
             .child(field(t!(Tr::CpAutoInterval), &p.interval))
             .child(row().child(button("save-interval", t!(Tr::CpSaveInterval)).on_click(cx.listener(|this, _, _, cx| {
@@ -2857,6 +2986,7 @@ mod tests {
             });
             Petal {
                 screen: Screen::Start(vec![]), cleanup_panel: panel, focus_handle,
+                menu_bar: crate::menubar::Monitor::new(),
                 error: None, notice: None, notice_warning: false, notice_version: 0,
                 access: Access::Dismissed, _access_watch: None,
                 color_by: ColorBy::Folder, chart: ChartType::Sunburst,
@@ -2989,6 +3119,60 @@ mod tests {
 
     #[cfg(feature = "snapshot")]
     #[gpui::test]
+    fn monitor_settings_layout_and_drafts_do_not_change_saved_configuration(cx: &mut gpui::TestAppContext) {
+        // No real AppKit status item, filesystem writes, scans or timers.
+        let window = cx.open_window(gpui::size(px(1240.), px(800.)), |window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            let mut panel = PanelState::with_settings(Ok(Settings::default()), cx);
+            panel.open = true;
+            panel.tab = 3;
+            panel.ai_busy = true;
+            panel.revision = 17;
+            panel.generation = 23;
+            let mut menu_bar = crate::menubar::Monitor::new();
+            menu_bar.disks = vec![crate::menubar::MountedDisk { name: "Test external disk".into(), path: PathBuf::from("/Volumes/Test") }];
+            Petal {
+                screen: Screen::Start(vec![]), cleanup_panel: panel, focus_handle, menu_bar,
+                error: None, notice: None, notice_warning: false, notice_version: 0,
+                access: Access::Dismissed, _access_watch: None,
+                color_by: ColorBy::Folder, chart: ChartType::Sunburst,
+            }
+        });
+        let view = window.root(cx).unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let draw = |visual: &mut gpui::VisualTestContext| visual.update(|window, cx| window.draw(cx).clear(cx));
+        draw(&mut visual);
+        let percent = visual.debug_bounds("monitor-unit-2").expect("percent option is visible");
+        visual.simulate_click(percent.center(), gpui::Modifiers::default());
+        draw(&mut visual);
+        let external = visual.debug_bounds("monitor-disk-1").expect("external disk is selectable");
+        visual.simulate_click(external.center(), gpui::Modifiers::default());
+        draw(&mut visual);
+        view.read_with(&visual, |this, _| {
+            assert_eq!(this.cleanup_panel.monitor_draft.display_unit, crate::menubar::DisplayUnit::Percent);
+            assert_eq!(this.cleanup_panel.monitor_draft.mount, PathBuf::from("/Volumes/Test"));
+            assert_eq!(this.cleanup_panel.settings.as_ref().unwrap().menu_bar, crate::menubar::MenuBarConfig::default());
+        });
+        view.update(&mut visual, |this, cx| {
+            this.cleanup_panel.monitor_threshold.update(cx, |input, cx| input.set_text("NaN", cx));
+            this.save_monitor_settings(cx); // Validation fails before any state file is touched.
+            assert_eq!(this.cleanup_panel.revision, 17);
+            assert_eq!(this.cleanup_panel.generation, 23);
+            assert!(this.cleanup_panel.ai_busy);
+            assert!(!this.cleanup_panel.message.is_empty());
+        });
+        visual.simulate_resize(gpui::size(px(860.), px(560.)));
+        draw(&mut visual);
+        let card = visual.debug_bounds("monitor-settings").unwrap();
+        let save = visual.debug_bounds("monitor-save").expect("save button remains reachable in compact window");
+        assert!(save.right() <= card.right());
+        assert!(save.bottom() <= card.bottom());
+        assert!(card.right() <= px(860.));
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
     fn rule_workspace_virtualizes_and_keeps_detail_usable(cx: &mut gpui::TestAppContext) {
         // A real GPUI layout, with no scan, timers, network or configuration writes.
         let window = cx.open_window(gpui::size(px(1240.), px(800.)), |window, cx| {
@@ -3003,6 +3187,7 @@ mod tests {
             });
             Petal {
                 screen: Screen::Start(vec![]), cleanup_panel, focus_handle,
+                menu_bar: crate::menubar::Monitor::new(),
                 error: None, notice: None, notice_warning: false, notice_version: 0,
                 access: Access::Dismissed, _access_watch: None,
                 color_by: ColorBy::Folder, chart: ChartType::Sunburst,

@@ -16,6 +16,7 @@ mod icons;
 mod json;
 mod live;
 mod motion;
+mod menubar;
 mod onboarding;
 mod rules;
 mod safety;
@@ -77,7 +78,14 @@ fn main() {
     // On first launch, start scanning the startup disk straight away.
     let initial = args.get(1).map(PathBuf::from).or_else(|| onboarding::is_first_run().then(|| PathBuf::from("/")));
 
-    gpui_platform::application().run(move |cx: &mut App| {
+    let application = gpui_platform::application();
+    application.on_reopen(|cx| {
+        cx.activate(true);
+        if let Some(handle) = cx.windows().first().copied() {
+            handle.update(cx, |_, window, _| window.activate()).ok();
+        }
+    });
+    application.run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| request_close(cx, true));
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());

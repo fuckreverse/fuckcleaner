@@ -75,6 +75,14 @@ pub struct Rule {
 }
 
 impl Rule {
+    pub fn name_label(&self) -> &str {
+        preset_label(&self.name).unwrap_or(&self.name)
+    }
+
+    pub fn description_label(&self) -> &str {
+        preset_label(&self.description).unwrap_or(&self.description)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.validate_in(&SafetyContext::current()?)
     }
@@ -139,19 +147,28 @@ impl Rule {
         }
         for root in &self.roots {
             let root = ctx.expand(root)?;
-            let meta =
-                fs::symlink_metadata(&root).map_err(|e| format!("{}: {e}", root.display()))?;
-            if !meta.is_dir() || meta.file_type().is_symlink() {
-                return Err(format!("Scope is not a real directory: {}", root.display()));
-            }
-            parent_identities(&root.join(".scope-check"), ctx)?;
-            let real = fs::canonicalize(&root).map_err(|e| e.to_string())?;
-            if !ctx.in_scope(&real) || equivalent(&real) == equivalent(&ctx.home) {
-                return Err("Canonical scope escapes the user boundary".into());
-            }
+            validate_root_scope(&root, ctx)?;
         }
         Ok(())
     }
+}
+
+fn validate_root_scope(root: &Path, ctx: &SafetyContext) -> Result<(), String> {
+    let meta = fs::symlink_metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(format!("Scope is not a real directory: {}", root.display()));
+    }
+    parent_identities(&root.join(".scope-check"), ctx)?;
+    let real = fs::canonicalize(root).map_err(|e| e.to_string())?;
+    if !ctx.in_scope(&real) || equivalent(&real) == equivalent(&ctx.home) {
+        return Err("Canonical scope escapes the user boundary".into());
+    }
+    Ok(())
+}
+
+fn is_project_preset(rule: &Rule) -> bool {
+    rule.source == RuleSource::BuiltIn && matches!(rule.id.as_str(),
+        "rust-target" | "nextjs-cache" | "vite-cache" | "webpack-cache" | "turbo-cache")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,7 +726,20 @@ pub(crate) fn match_path(
         .map_err(|_| "Future modification time")?;
     let mut matches = Vec::new();
     for rule in settings.rules.iter().filter(|r| r.enabled) {
-        if let Err(error) = rule.validate_active_in(ctx) {
+        let validation = if is_project_preset(rule) {
+            rule.validate_in(ctx).and_then(|_| {
+                for root in &rule.roots {
+                    let root = ctx.expand(root)?;
+                    if relative_to(path, &root).is_some() {
+                        validate_root_scope(&root, ctx)?;
+                    }
+                }
+                Ok(())
+            })
+        } else {
+            rule.validate_active_in(ctx)
+        };
+        if let Err(error) = validation {
             // An invalid overlapping rule cannot disappear and weaken another rule.
             if rule.roots.iter().any(|r| {
                 ctx.expand(r)
@@ -733,13 +763,18 @@ pub(crate) fn match_path(
         let pattern = compile_glob(&rule.pattern)?;
         for root in &rule.roots {
             let root = ctx.expand(root)?;
+            if is_project_preset(rule) && relative_to(path, &root).is_none() {
+                continue;
+            }
             let real = match fs::canonicalize(&root) {
                 Ok(p) => p,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.to_string()),
             };
             if let Some(relative) = relative_to(path, &real) {
-                if pattern.is_match(relative) {
+                if pattern.is_match(relative)
+                    && project_marker(path, rule).is_none_or(|marker| valid_project_marker(&marker, ctx))
+                {
                     matches.push(rule);
                     break;
                 }
@@ -758,6 +793,7 @@ fn make_match(
     mut matches: Vec<&Rule>,
 ) -> Result<Option<RuleMatch>, String> {
     matches.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
+    matches.dedup_by(|a, b| a.id == b.id);
     let Some(priority_winner) = matches.first() else {
         return Ok(None);
     };
@@ -843,6 +879,7 @@ struct PreviewPolicy<'a> {
     whitelist: Vec<PathBuf>,
     unreadable: Vec<PathBuf>,
     parents: HashMap<PathBuf, Result<Vec<PathIdentity>, String>>,
+    project_markers: HashMap<PathBuf, bool>,
 }
 impl<'a> PreviewPolicy<'a> {
     fn compile(
@@ -860,6 +897,28 @@ impl<'a> PreviewPolicy<'a> {
         for rule in settings.rules.iter().filter(|r| r.enabled) {
             if cancel.load(Ordering::Acquire) {
                 return Err("cancelled".into());
+            }
+            // Each optional project root is independent; a removed ~/work must not
+            // disable valid ~/src caches. Invalid roots still veto paths within them.
+            if is_project_preset(rule) {
+                for root in &rule.roots {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err("cancelled".into());
+                    }
+                    let root = ctx.expand(root)?;
+                    let invalid = validate_root_scope(&root, ctx).err();
+                    if let Some(error) = &invalid {
+                        plan.block(|| format!("Rule {} unavailable at {}: {error}", rule.id, root.display()));
+                    }
+                    #[cfg(test)]
+                    { plan.rule_compilations += 1; }
+                    rules.push(CompiledRule {
+                        rule, roots: vec![equivalent(&root)], pattern: compile_glob(&rule.pattern)?,
+                        exclude: rule.exclude.iter().map(|p| compile_glob(p)).collect::<Result<_, _>>()?,
+                        invalid,
+                    });
+                }
+                continue;
             }
             // Settings already passed static schema validation above.
             let mut invalid = rule.validate_scope_in(ctx).err();
@@ -928,6 +987,7 @@ impl<'a> PreviewPolicy<'a> {
                 .map(|u| equivalent(&u.path))
                 .collect(),
             parents: HashMap::new(),
+            project_markers: HashMap::new(),
         })
     }
 
@@ -985,6 +1045,14 @@ impl<'a> PreviewPolicy<'a> {
                 }
             }
         }
+        // Project roots can contain many source files; only stat positive glob matches.
+        if !candidates.iter().any(|&index| {
+            let compiled = &self.rules[index];
+            compiled.roots.iter().any(|root| path.strip_prefix(root).ok()
+                .is_some_and(|relative| compiled.pattern.is_match(relative)))
+        }) {
+            return Ok(None);
+        }
         // Keep operation paths as scanned, not their equivalent policy aliases.
         // The caller passes the original path to the filesystem phase below.
         self.match_metadata(operation_path, ctx, now, &candidates, plan)
@@ -1032,7 +1100,7 @@ impl<'a> PreviewPolicy<'a> {
             .map_err(|_| "Future modification time")?
             .as_secs();
         let policy_path = equivalent(path);
-        let matches = candidate_indices
+        let matches: Vec<_> = candidate_indices
             .iter()
             .map(|&ix| &self.rules[ix])
             .filter(|r| {
@@ -1048,6 +1116,10 @@ impl<'a> PreviewPolicy<'a> {
                     })
             })
             .map(|r| r.rule)
+            .filter(|rule| project_marker(path, rule).is_none_or(|marker| {
+                *self.project_markers.entry(marker.clone())
+                    .or_insert_with(|| valid_project_marker(&marker, ctx))
+            }))
             .collect();
         make_match(path, ctx, &meta, parents, age, matches)
     }
@@ -1255,7 +1327,7 @@ pub fn built_in_rules() -> Vec<Rule> {
     built_ins_in(&ctx)
 }
 
-fn built_ins_in(ctx: &SafetyContext) -> Vec<Rule> {
+pub(crate) fn built_ins_in(ctx: &SafetyContext) -> Vec<Rule> {
     let definitions = [
         (
             "app-caches",
@@ -1298,6 +1370,14 @@ fn built_ins_in(ctx: &SafetyContext) -> Vec<Rule> {
             7,
         ),
         (
+            "cargo-download-cache",
+            "Cargo downloaded crate cache (review)",
+            CleanupCategory::Cache,
+            ".cargo/registry/cache",
+            "**/*.crate",
+            30,
+        ),
+        (
             "old-log-backups",
             "Rotated log backups (review)",
             CleanupCategory::Backup,
@@ -1330,7 +1410,90 @@ fn built_ins_in(ctx: &SafetyContext) -> Vec<Rule> {
             source: RuleSource::BuiltIn,
         });
     }
+    if let Some(rule) = rules.iter_mut().find(|rule| rule.id == "cargo-download-cache") {
+        rule.description = "Old downloaded .crate archives only; Cargo downloads them again when needed. Registry sources, index, installed tools and configuration are not matched.".into();
+    }
+    rules.extend(project_build_rules(ctx));
     rules
+}
+
+fn project_build_rules(ctx: &SafetyContext) -> Vec<Rule> {
+    // Do not authorize the whole home, personal folders or app-managed locations.
+    // Discover only available trusted roots; later root failures are isolated during matching.
+    let mut roots: Vec<_> = ["src", "code", "dev", "projects", "repos", "work", "git", "github", "Developer"]
+        .into_iter()
+        .map(|name| ctx.home.join(name))
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            && parent_identities(&path.join(".scope-check"), ctx).is_ok())
+        .collect();
+    if roots.is_empty() {
+        // Remain visible and editable even before the user creates a project directory.
+        roots.push(ctx.home.join("src"));
+    }
+    [
+        ("rust-target", "Rust / Cargo build cache (review)", "**/target/**/*",
+            "Old ordinary files in Cargo target directories, including incremental compilation. Requires Cargo.toml beside target; cargo build rebuilds them."),
+        ("nextjs-cache", "Next.js / React build cache (review)", "**/.next/cache/**/*",
+            "Old ordinary files in .next/cache only, not Next.js server or deployment outputs. Requires package.json in the project."),
+        ("vite-cache", "Vite / React dependency cache (review)", "**/node_modules/.vite/**/*",
+            "Old ordinary files in node_modules/.vite; Vite regenerates its dependency cache. Requires package.json beside node_modules."),
+        ("webpack-cache", "Webpack / CRA / React build cache (review)", "**/node_modules/.cache/**/*",
+            "Old ordinary files in node_modules/.cache, including Webpack and Babel caches. Requires package.json beside node_modules; installed dependencies are not matched."),
+        ("turbo-cache", "Turborepo build cache (review)", "**/.turbo/cache/**/*",
+            "Old ordinary files in .turbo/cache only, not daemon state. Requires package.json in the project."),
+    ].into_iter().map(|(id, name, pattern, description)| Rule {
+        id: id.into(), name: name.into(), description: description.into(),
+        category: CleanupCategory::Build, roots: roots.clone(), pattern: pattern.into(),
+        exclude: vec![], min_size: 0, older_than_days: Some(30), priority: 0,
+        enabled: true, auto_clean: false, action: CleanupAction::Trash, source: RuleSource::BuiltIn,
+    }).collect()
+}
+
+// Translate the shipped text, not IDs: edited names and descriptions must remain visible.
+fn preset_label(text: &str) -> Option<&'static str> {
+    use crate::i18n::{Tr, tr};
+    let key = match text {
+        "Cargo downloaded crate cache (review)" => Tr::CpPresetCargoCache,
+        "Rust / Cargo build cache (review)" => Tr::CpPresetRustTarget,
+        "Next.js / React build cache (review)" => Tr::CpPresetNextCache,
+        "Vite / React dependency cache (review)" => Tr::CpPresetViteCache,
+        "Webpack / CRA / React build cache (review)" => Tr::CpPresetWebpackCache,
+        "Turborepo build cache (review)" => Tr::CpPresetTurboCache,
+        "Old ordinary files in Cargo target directories, including incremental compilation. Requires Cargo.toml beside target; cargo build rebuilds them." => Tr::CpPresetRustDescription,
+        "Old ordinary files in .next/cache only, not Next.js server or deployment outputs. Requires package.json in the project." => Tr::CpPresetNextDescription,
+        "Old ordinary files in node_modules/.vite; Vite regenerates its dependency cache. Requires package.json beside node_modules." => Tr::CpPresetViteDescription,
+        "Old ordinary files in node_modules/.cache, including Webpack and Babel caches. Requires package.json beside node_modules; installed dependencies are not matched." => Tr::CpPresetWebpackDescription,
+        "Old ordinary files in .turbo/cache only, not daemon state. Requires package.json in the project." => Tr::CpPresetTurboDescription,
+        "Old downloaded .crate archives only; Cargo downloads them again when needed. Registry sources, index, installed tools and configuration are not matched." => Tr::CpPresetCargoDescription,
+        _ => return None,
+    };
+    Some(tr(key))
+}
+
+// Additional guards for shipped project presets; user-authored rules keep their explicit semantics.
+fn project_marker(path: &Path, rule: &Rule) -> Option<PathBuf> {
+    if rule.source != RuleSource::BuiltIn {
+        return None;
+    }
+    let (directory, marker) = match rule.id.as_str() {
+        "rust-target" => ("target", "Cargo.toml"),
+        "nextjs-cache" => (".next", "package.json"),
+        "vite-cache" | "webpack-cache" => ("node_modules", "package.json"),
+        "turbo-cache" => (".turbo", "package.json"),
+        _ => return None,
+    };
+    path.ancestors().skip(1)
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(directory)))
+        .and_then(Path::parent)
+        .map(|project| project.join(marker))
+        // A known preset with an edited pattern still fails closed without its directory.
+        .or_else(|| Some(path.join(marker)))
+}
+
+fn valid_project_marker(path: &Path, ctx: &SafetyContext) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_file() && !meta.file_type().is_symlink() && meta.uid() == ctx.uid && meta.nlink() == 1
+    })
 }
 
 #[cfg(test)]
@@ -1381,12 +1544,14 @@ pub(crate) mod fixtures {
             Settings {
                 version: crate::settings::SETTINGS_VERSION,
                 rules: built_ins_in(&self.ctx),
+                built_in_rules_revision: crate::settings::BUILT_IN_RULES_REVISION,
                 whitelist: vec![],
                 default_action: CleanupAction::Trash,
                 automation_enabled: false,
                 automation_interval_minutes: 60,
                 agent: crate::agent::AgentConfig::default(),
                 language: None,
+                menu_bar: crate::menubar::MenuBarConfig::default(),
             }
         }
         pub fn tree(&self, path: &Path) -> Tree {
@@ -1434,6 +1599,149 @@ pub(crate) mod fixtures {
 mod tests {
     use super::*;
     use fixtures::Fixture;
+    #[test]
+    fn project_presets_match_only_verified_old_cache_files() {
+        let f = Fixture::new();
+        for relative in ["src/rust/Cargo.toml", "src/ui/package.json", "src/ui/packages/app/package.json"] {
+            f.file(relative, 0);
+        }
+        let settings = f.settings();
+        for (relative, id) in [
+            ("src/rust/target/debug/deps/libexample.rlib", "rust-target"),
+            ("src/rust/target/debug/incremental/example/query-cache.bin", "rust-target"),
+            ("src/rust/target/aarch64-apple-darwin/release/deps/libexample.rmeta", "rust-target"),
+            ("src/ui/.next/cache/webpack/client/pack.gz", "nextjs-cache"),
+            ("src/ui/node_modules/.vite/deps/react.js", "vite-cache"),
+            ("src/ui/node_modules/.cache/webpack/pack.gz", "webpack-cache"),
+            ("src/ui/.turbo/cache/hash.tar.zst", "turbo-cache"),
+            ("src/ui/packages/app/.next/cache/swc/cache.bin", "nextjs-cache"),
+            (".cargo/registry/cache/index/crate-1.0.crate", "cargo-download-cache"),
+        ] {
+            let path = f.file(relative, 31);
+            let plan = evaluate_in(&f.tree(&path), &settings, &f.ctx);
+            assert_eq!(plan.items.len(), 1, "{relative}: {:?}", plan.blocked);
+            let item = &plan.items[0];
+            assert_eq!(item.rule_id, id);
+            assert_eq!(item.action, CleanupAction::Trash);
+            assert!(!item.auto_clean);
+            let current = match_path(&path, &settings, &f.ctx, SystemTime::now()).unwrap().unwrap();
+            assert_eq!(current.rule_id, id);
+            assert_eq!(current.rule_revision, item.rule_revision);
+            f.file(relative, 29);
+            assert!(evaluate_in(&f.tree(&path), &settings, &f.ctx).items.is_empty());
+            assert!(match_path(&path, &settings, &f.ctx, SystemTime::now()).unwrap().is_none());
+        }
+        for relative in [
+            "src/plain/target/data.bin", "src/plain/.next/cache/cache.bin",
+            "src/plain/Target/debug/data.bin", "src/plain/.NEXT/cache/data.bin",
+            "src/plain/NODE_MODULES/.VITE/data.js", "src/plain/NODE_MODULES/.CACHE/data.bin",
+            "src/plain/.TURBO/cache/data.bin",
+            "src/plain/node_modules/.vite/react.js", "src/plain/node_modules/.cache/pack.gz",
+            "src/plain/.turbo/cache/hash.tar.zst", "src/ui/node_modules/react/index.js",
+            "src/ui/.next/server/app.js", "src/ui/.turbo/daemon/state.bin",
+            "src/ui/dist/app.js", "src/ui/build/app.js", "src/ui/.cache/personal.bin",
+            "src/rust/src/main.rs", ".cargo/registry/src/index/crate/lib.rs",
+            ".cargo/registry/index/config.json", ".cargo/bin/tool", ".cargo/config.toml",
+        ] {
+            let path = f.file(relative, 31);
+            assert!(evaluate_in(&f.tree(&path), &settings, &f.ctx).items.is_empty(), "{relative}");
+            assert!(match_path(&path, &settings, &f.ctx, SystemTime::now()).unwrap().is_none(), "{relative}");
+        }
+    }
+
+    #[test]
+    fn project_presets_respect_markers_whitelists_and_symlinks() {
+        let f = Fixture::new();
+        let marker = f.file("src/rust/Cargo.toml", 0);
+        let path = f.file("src/rust/target/debug/incremental/query-cache.bin", 31);
+        let mut settings = f.settings();
+        settings.whitelist.push(path.parent().unwrap().into());
+        assert!(evaluate_in(&f.tree(&path), &settings, &f.ctx).items.is_empty());
+        settings.whitelist.clear();
+        fs::remove_file(&marker).unwrap();
+        assert!(match_path(&path, &settings, &f.ctx, SystemTime::now()).unwrap().is_none());
+        let outside = f.file("outside/Cargo.toml", 0);
+        std::os::unix::fs::symlink(outside, &marker).unwrap();
+        assert!(evaluate_in(&f.tree(&path), &settings, &f.ctx).items.is_empty());
+        assert!(match_path(&path, &settings, &f.ctx, SystemTime::now()).unwrap().is_none());
+        fs::remove_file(&marker).unwrap();
+        f.file("src/rust/Cargo.toml", 0);
+        let link = path.with_file_name("linked.bin");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(evaluate_in(&f.tree(&link), &settings, &f.ctx).items.is_empty());
+        for rule in settings.rules.iter_mut().filter(|rule| project_marker(&path, rule).is_some()) {
+            rule.auto_clean = true;
+            assert!(rule.validate_in(&f.ctx).is_err());
+        }
+    }
+
+    #[test]
+    fn project_presets_use_existing_concrete_project_roots() {
+        let f = Fixture::new();
+        for relative in ["src/rust/Cargo.toml", "code/ui/package.json", "projects/ui/package.json"] {
+            f.file(relative, 0);
+        }
+        std::os::unix::fs::symlink(f.ctx.home.join("code"), f.ctx.home.join("repos")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir(f.ctx.home.join("work")).unwrap();
+        fs::set_permissions(f.ctx.home.join("work"), fs::Permissions::from_mode(0o770)).unwrap();
+        let settings = f.settings();
+        let roots = &settings.rules.iter().find(|rule| rule.id == "rust-target").unwrap().roots;
+        assert_eq!(roots, &vec![f.ctx.home.join("src"), f.ctx.home.join("code"), f.ctx.home.join("projects")]);
+        for relative in ["code/ui/node_modules/.vite/react.js", "projects/ui/.next/cache/pack.gz"] {
+            let path = f.file(relative, 31);
+            assert_eq!(evaluate_in(&f.tree(&path), &settings, &f.ctx).items.len(), 1);
+        }
+        fs::remove_dir_all(f.ctx.home.join("code")).unwrap();
+        let path = f.file("src/rust/target/debug/deps/libexample.rlib", 31);
+        assert_eq!(evaluate_in(&f.tree(&path), &settings, &f.ctx).items.len(), 1);
+        assert!(match_path(&path, &settings, &f.ctx, SystemTime::now()).unwrap().is_some());
+        fs::set_permissions(f.ctx.home.join("projects"), fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(evaluate_in(&f.tree(&path), &settings, &f.ctx).items.len(), 1);
+        let unsafe_path = f.file("projects/ui/.next/cache/pack.gz", 31);
+        assert!(evaluate_in(&f.tree(&unsafe_path), &settings, &f.ctx).items.is_empty());
+        assert!(match_path(&unsafe_path, &settings, &f.ctx, SystemTime::now()).is_err());
+        let f = Fixture::new();
+        let settings = f.settings();
+        assert!(settings.validate_in(&f.ctx).is_ok());
+        assert_eq!(settings.rules.iter().find(|rule| rule.id == "rust-target").unwrap().roots,
+            vec![f.ctx.home.join("src")]);
+    }
+
+    #[test]
+    fn project_preview_and_execution_agree_for_overlapping_and_unavailable_roots() {
+        let f = Fixture::new();
+        f.file("src/rust/Cargo.toml", 0);
+        f.file("work/ui/package.json", 0);
+        let path = f.file("src/rust/target/debug/deps/libexample.rlib", 31);
+        let mut settings = f.settings();
+        let rule = settings.rules.iter_mut().find(|rule| rule.id == "rust-target").unwrap();
+        rule.roots.push(f.ctx.home.join("src/rust"));
+        rule.roots.push(f.ctx.home.join("src"));
+        fs::remove_dir_all(f.ctx.home.join("work")).unwrap();
+        std::os::unix::fs::symlink("work", f.ctx.home.join("work")).unwrap();
+        let plan = evaluate_in(&f.tree(&path), &settings, &f.ctx);
+        assert_eq!(plan.items.len(), 1);
+        let current = match_path(&path, &settings, &f.ctx, SystemTime::now()).unwrap().unwrap();
+        assert_eq!(plan.items[0].matched_rule_ids, vec!["rust-target"]);
+        assert_eq!(plan.items[0].matched_rule_ids, current.matched_rule_ids);
+        assert_eq!(plan.items[0].rule_revision, current.rule_revision);
+    }
+
+    #[test]
+    fn preset_labels_preserve_user_edits_and_cover_translations() {
+        let f = Fixture::new();
+        for rule in f.settings().rules.iter().filter(|rule| rule.id == "cargo-download-cache" || is_project_preset(rule)) {
+            assert!(preset_label(&rule.name).is_some());
+            assert!(preset_label(&rule.description).is_some());
+        }
+        let mut rule = f.settings().rules.remove(0);
+        rule.name = "My personal cache rule".into();
+        rule.description = "Keep my description".into();
+        assert_eq!(rule.name_label(), rule.name);
+        assert_eq!(rule.description_label(), rule.description);
+    }
+
     #[test]
     fn validation_rejects_dangerous_scopes_and_globs() {
         let f = Fixture::new();

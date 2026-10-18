@@ -13,6 +13,7 @@ use crate::rules::{CleanupAction, Rule, SafetyContext};
 use serde::{Deserialize, Serialize};
 
 pub const SETTINGS_VERSION: u32 = 1;
+pub(crate) const BUILT_IN_RULES_REVISION: u32 = 1;
 fn interval_default() -> u64 {
     60
 }
@@ -22,6 +23,9 @@ fn interval_default() -> u64 {
 pub struct Settings {
     pub version: u32,
     pub rules: Vec<Rule>,
+    /// One-time preset upgrades; deleting a preset after saving must stay respected.
+    #[serde(default)]
+    pub built_in_rules_revision: u32,
     #[serde(default)]
     pub whitelist: Vec<PathBuf>,
     #[serde(default)]
@@ -35,18 +39,22 @@ pub struct Settings {
     /// Interface language. `None` follows the system language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<crate::i18n::Lang>,
+    #[serde(default)]
+    pub menu_bar: crate::menubar::MenuBarConfig,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             version: SETTINGS_VERSION,
             rules: crate::rules::built_in_rules(),
+            built_in_rules_revision: BUILT_IN_RULES_REVISION,
             whitelist: vec![],
             default_action: CleanupAction::Trash,
             automation_enabled: false,
             automation_interval_minutes: interval_default(),
             agent: crate::agent::AgentConfig::default(),
             language: None,
+            menu_bar: crate::menubar::MenuBarConfig::default(),
         }
     }
 }
@@ -83,6 +91,7 @@ impl Settings {
             ctx.expand(entry)
                 .map_err(|e| format!("Invalid whitelist path: {e}"))?;
         }
+        self.menu_bar.validate()?;
         self.agent.validate()?;
         // Credentials belong in the agent's Keychain integration, never this JSON file.
         reject_secrets(&serde_json::to_value(&self.agent).map_err(|e| e.to_string())?)?;
@@ -102,7 +111,7 @@ impl Settings {
             Ok(dir) => dir,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let settings = Self {
-                    rules: crate::rules::built_in_rules(),
+                    rules: crate::rules::built_ins_in(ctx),
                     ..Self::default()
                 };
                 settings.validate_in(ctx)?;
@@ -114,7 +123,7 @@ impl Settings {
         let mut file = match open_private_at(&dir, name, false, false) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let settings = Self::default();
+                let settings = Self { rules: crate::rules::built_ins_in(ctx), ..Self::default() };
                 settings.validate_in(ctx)?;
                 return Ok(settings);
             }
@@ -128,11 +137,31 @@ impl Settings {
         if bytes.len() > 4 * 1024 * 1024 {
             return Err("Settings exceed the size limit".into());
         }
-        let settings: Self = serde_json::from_slice(&bytes)
+        let mut settings: Self = serde_json::from_slice(&bytes)
             .map_err(|e| format!("Invalid settings; original file left intact: {e}"))?;
+        settings.validate_in(ctx)?;
+        settings.upgrade_built_in_rules(ctx);
         settings.validate_in(ctx)?;
         Ok(settings)
     }
+
+    fn upgrade_built_in_rules(&mut self, ctx: &SafetyContext) {
+        if self.built_in_rules_revision >= BUILT_IN_RULES_REVISION {
+            return;
+        }
+        // Add only this revision's new presets. Do not restore older deleted presets,
+        // replace edited rules, or overwrite a user rule with the same ID.
+        let ids: HashSet<_> = self.rules.iter().map(|rule| rule.id.clone()).collect();
+        for rule in crate::rules::built_ins_in(ctx) {
+            if matches!(rule.id.as_str(), "cargo-download-cache" | "rust-target" | "nextjs-cache"
+                | "vite-cache" | "webpack-cache" | "turbo-cache") && !ids.contains(&rule.id)
+            {
+                self.rules.push(rule);
+            }
+        }
+        self.built_in_rules_revision = BUILT_IN_RULES_REVISION;
+    }
+
     fn save_in(&self, path: &Path, ctx: &SafetyContext) -> Result<(), String> {
         self.validate_in(ctx)?;
         let parent = path.parent().ok_or("Settings path has no parent")?;
@@ -443,6 +472,81 @@ mod tests {
         assert!(Settings::load_in(&path, &f.ctx).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"broken");
     }
+    #[test]
+    fn legacy_config_gets_new_presets_without_overwriting_edits_or_restoring_deletions() {
+        let f = Fixture::new();
+        f.file("code/ui/package.json", 0);
+        let path = f.dir.join("state/settings.json");
+        let mut config = f.settings();
+        config.rules.retain(|rule| rule.id == "app-caches");
+        config.rules[0].name = "My edited cache rule".into();
+        config.rules[0].enabled = false;
+        let mut custom = config.rules[0].clone();
+        custom.id = "vite-cache".into();
+        custom.source = crate::rules::RuleSource::User;
+        config.rules.push(custom);
+        config.save_in(&path, &f.ctx).unwrap();
+        // Reproduce a pre-upgrade configuration with no revision field.
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy.as_object_mut().unwrap().remove("built_in_rules_revision");
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let mut loaded = Settings::load_in(&path, &f.ctx).unwrap();
+        assert_eq!(loaded.built_in_rules_revision, BUILT_IN_RULES_REVISION);
+        assert_eq!(loaded.rules.len(), 7);
+        assert_eq!(loaded.rules[0].name, "My edited cache rule");
+        assert!(!loaded.rules[0].enabled);
+        assert_eq!(loaded.rules[1].source, crate::rules::RuleSource::User);
+        assert_eq!(loaded.rules[1].name, "My edited cache rule");
+        assert!(!loaded.rules.iter().any(|rule| rule.id == "app-logs"));
+        assert!(loaded.rules.iter().filter(|rule| rule.source == crate::rules::RuleSource::BuiltIn)
+            .all(|rule| !rule.auto_clean && rule.action == CleanupAction::Trash));
+        assert_eq!(fs::read(&path).unwrap(), bytes, "loading never overwrites the original config");
+        loaded.rules.retain(|rule| rule.id != "rust-target");
+        loaded.save_in(&path, &f.ctx).unwrap();
+        let reloaded = Settings::load_in(&path, &f.ctx).unwrap();
+        assert_eq!(reloaded.rules.len(), loaded.rules.len());
+        assert!(!reloaded.rules.iter().any(|rule| rule.id == "rust-target"));
+    }
+
+    #[test]
+    fn missing_config_uses_the_supplied_home_and_current_presets() {
+        let f = Fixture::new();
+        let path = f.dir.join("state/settings.json");
+        let settings = Settings::load_in(&path, &f.ctx).unwrap();
+        assert_eq!(settings.built_in_rules_revision, BUILT_IN_RULES_REVISION);
+        assert!(settings.rules.iter().all(|rule| rule.roots.iter().all(|root| root.starts_with(&f.ctx.home))));
+        assert!(settings.rules.iter().any(|rule| rule.id == "rust-target"));
+        settings.save_in(&path, &f.ctx).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(Settings::load_in(&path, &f.ctx).unwrap().rules.len(), settings.rules.len());
+    }
+
+    #[test]
+    fn legacy_config_defaults_monitor_and_custom_monitor_round_trips() {
+        let f = Fixture::new();
+        let path = f.dir.join("state/settings.json");
+        let mut settings = f.settings();
+        settings.save_in(&path, &f.ctx).unwrap();
+        let mut legacy = serde_json::to_value(&settings).unwrap();
+        legacy.as_object_mut().unwrap().remove("menu_bar");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(Settings::load_in(&path, &f.ctx).unwrap().menu_bar, crate::menubar::MenuBarConfig::default());
+        settings.menu_bar = crate::menubar::MenuBarConfig {
+            enabled: false,
+            mount: PathBuf::from("/Volumes/Offline"),
+            display_unit: crate::menubar::DisplayUnit::Percent,
+            threshold_unit: crate::menubar::ThresholdUnit::Gigabytes,
+            threshold: 25.5,
+            refresh_seconds: 15,
+        };
+        settings.save_in(&path, &f.ctx).unwrap();
+        assert_eq!(Settings::load_in(&path, &f.ctx).unwrap().menu_bar, settings.menu_bar);
+        settings.menu_bar.refresh_seconds = 0;
+        assert!(settings.save_in(&path, &f.ctx).is_err());
+        assert_eq!(Settings::load_in(&path, &f.ctx).unwrap().menu_bar.refresh_seconds, 15);
+    }
+
     #[test]
     fn rejects_unknown_version_duplicates_empty_whitelist_and_secrets() {
         let f = Fixture::new();

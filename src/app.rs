@@ -754,6 +754,7 @@ enum Access {
 pub struct Petal {
     screen: Screen,
     cleanup_panel: cleanup_panel::PanelState,
+    menu_bar: crate::menubar::Monitor,
     focus_handle: FocusHandle,
     error: Option<String>,
     /// A short confirmation at the bottom of the window; `notice_version` lets a newer
@@ -780,6 +781,7 @@ impl Petal {
         let mut this = Self {
             screen: Screen::Start(scan::volumes()),
             cleanup_panel: cleanup_panel::PanelState::new(cx),
+            menu_bar: crate::menubar::Monitor::new(),
             focus_handle,
             error: None,
             notice: None,
@@ -791,6 +793,7 @@ impl Petal {
             chart: ChartType::Sunburst,
         };
         this.install_chat_shutdown(window, cx);
+        this.start_menu_bar_monitor(window, cx);
         this.start_cleanup_scheduler(cx);
         if access == Access::Missing {
             this._access_watch = Some(this.watch_access(cx));
@@ -802,6 +805,66 @@ impl Petal {
             this.start_scan(path, cx);
         }
         this
+    }
+
+    fn start_menu_bar_monitor(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // Poll commands on the foreground executor; AppKit never calls GPUI from
+        // inside its target/action callback (which would re-enter an App borrow).
+        self.menu_bar.poll(self.menu_bar_config());
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let request = handle.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        let commands = this.menu_bar.poll(this.menu_bar_config());
+                        for command in commands {
+                            use crate::menubar::Command;
+                            match command {
+                                Command::Show => { cx.activate(true); window.activate(); }
+                                Command::Settings => {
+                                    cx.activate(true);
+                                    window.activate();
+                                    this.open_monitor_settings(cx);
+                                }
+                                Command::Clean => {
+                                    cx.activate(true);
+                                    window.activate();
+                                    if let Some(config) = this.menu_bar_config() {
+                                        if !this.cleanup_panel.executing() {
+                                            this.cleanup_panel.open = false;
+                                            this.start_scan(config.mount, cx);
+                                        }
+                                    }
+                                }
+                                Command::Refresh => this.menu_bar.refresh_now(),
+                                Command::Quit => this.request_chat_close(true, window, cx),
+                            }
+                        }
+                        this.menu_bar.refresh_request()
+                    })
+                });
+                let Ok(Ok(request)) = request else { break; };
+                if let Some((generation, path)) = request {
+                    this.update(cx, |_, cx| {
+                        cx.spawn(async move |this, cx| {
+                            let read_path = path.clone();
+                            let (disks, space) = cx.background_spawn(async move {
+                                (crate::menubar::mounted_disks(), crate::menubar::read_space(&read_path))
+                            }).await;
+                            this.update(cx, |this, cx| {
+                                this.menu_bar.finish_refresh(generation, &path, disks, space);
+                                cx.notify();
+                            }).ok();
+                        }).detach();
+                    }).ok();
+                }
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+            }
+        }).detach();
+    }
+
+    pub(crate) fn menu_bar_enabled(&self) -> bool {
+        self.menu_bar.enabled()
     }
 
     /// Re-check every couple of seconds while access is missing, so the card can react as

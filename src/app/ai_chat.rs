@@ -685,6 +685,13 @@ impl Petal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !quit && self.menu_bar_enabled() {
+            // Keep the root entity, ongoing scans and persistence alive while the
+            // menu bar monitor runs. Cmd-Q still uses the existing drain gate.
+            self.queue_chat_save(cx);
+            cx.hide();
+            return;
+        }
         if self.cleanup_panel.chat.closing {
             return;
         }
@@ -711,6 +718,8 @@ impl Petal {
                     // Keep the view and all memory-only sessions alive. Never retry
                     // automatically or override an archive that failed to load.
                     let answer = handle.update(cx, |_, window, cx| {
+                        cx.activate(true);
+                        window.activate();
                         this.update(cx, |this, cx| {
                             this.panel_message(tf!(Tr::CpChatSaveFailed, "e" => &error), cx);
                         }).ok();
@@ -1627,6 +1636,7 @@ mod tests {
                 let mut this = Petal {
                     screen: Screen::Start(vec![]),
                     cleanup_panel: PanelState::with_settings(Ok(Settings::default()), cx),
+                    menu_bar: crate::menubar::Monitor::new(),
                     focus_handle: cx.focus_handle(),
                     error: None,
                     notice: None,
@@ -1703,6 +1713,7 @@ mod tests {
             let mut this = Petal {
                 screen: Screen::Start(vec![]),
                 cleanup_panel: PanelState::with_settings(Ok(Settings::default()), cx),
+                menu_bar: crate::menubar::Monitor::new(),
                 focus_handle: cx.focus_handle(),
                 error: None,
                 notice: None,
@@ -1899,6 +1910,7 @@ mod tests {
             Petal {
                 screen: Screen::Start(vec![]),
                 cleanup_panel: panel,
+                menu_bar: crate::menubar::Monitor::new(),
                 focus_handle: cx.focus_handle(),
                 error: None,
                 notice: None,
@@ -2025,6 +2037,7 @@ mod tests {
             Petal {
                 screen: Screen::Start(vec![]),
                 cleanup_panel: panel,
+                menu_bar: crate::menubar::Monitor::new(),
                 focus_handle: cx.focus_handle(),
                 error: None,
                 notice: None,
@@ -2083,6 +2096,7 @@ mod tests {
                 Petal {
                     screen: Screen::Start(vec![]),
                     cleanup_panel: panel,
+                    menu_bar: crate::menubar::Monitor::new(),
                     focus_handle: cx.focus_handle(),
                     error: None,
                     notice: None,
@@ -2431,6 +2445,7 @@ mod tests {
             Petal {
                 screen: Screen::Start(vec![]),
                 cleanup_panel: panel,
+                menu_bar: crate::menubar::Monitor::new(),
                 focus_handle: cx.focus_handle(),
                 error: None,
                 notice: None,
@@ -2496,6 +2511,7 @@ mod tests {
         let window = cx.open_window(gpui::size(px(900.), px(700.)), |_, cx| Petal {
             screen: Screen::Start(vec![]),
             cleanup_panel: PanelState::with_settings(Ok(Settings::default()), cx),
+            menu_bar: crate::menubar::Monitor::new(),
             focus_handle: cx.focus_handle(),
             error: None,
             notice: None,
