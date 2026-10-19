@@ -87,7 +87,13 @@ jobs:
             . -> target/bundle
       - name: Check the runner architecture
         run: test "$(uname -m)" = "$ARCH"
+      # The admin integration test launches the standalone application as a helper.
+      # cargo test only builds the test harness, so prepare the binary on cold runners.
+      - name: Build the standalone helper used by integration tests
+        run: cargo build --release --locked
       - name: Run tests, including the GPUI test platform
+        env:
+          CARGO_BIN_EXE_petal: ${{ github.workspace }}/target/release/petal
         run: cargo test --release --locked --features snapshot
       - name: Build the application and disk image
         run: bash scripts/bundle.sh --dmg
