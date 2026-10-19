@@ -159,11 +159,11 @@ impl AiTurn {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Token {
-    scan: u64,
-    revision: u64,
-    generation: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Token {
+    pub(super) scan: u64,
+    pub(super) revision: u64,
+    pub(super) generation: u64,
 }
 
 pub(super) struct PanelState {
@@ -600,14 +600,22 @@ impl Petal {
     // Live refresh invalidates all cleanup plans/drafts, but cannot change the
     // sealed read-only snapshot already used by an AI conversation.
     pub(super) fn invalidate_scan_cleanup_jobs(&mut self) {
+        if let Screen::Results(r) = &mut self.screen { r.revoke_ai_collector(); }
         let p = &mut self.cleanup_panel;
         p.preview_cancel.store(true, Ordering::Release);
         p.generation = p.generation.wrapping_add(1);
         p.plan = None;
         p.selected.clear();
-        if p.response.as_ref().is_some_and(|(_, response)| !response.proposals.is_empty()) {
-            if let Some(turn) = &mut p.ai_turn {
-                turn.detail = t!(Tr::CpAiDraftsExpired).into();
+        if let Some((_, response)) = &p.response {
+            let had_actions = !response.proposals.is_empty() || !response.pending_deletions.is_empty();
+            if had_actions {
+                if let Some(turn) = &mut p.ai_turn {
+                    turn.detail = if !response.pending_deletions.is_empty() {
+                        t!(Tr::CpAiPendingExpired)
+                    } else {
+                        t!(Tr::CpAiDraftsExpired)
+                    }.into();
+                }
             }
         }
         p.response = None;
@@ -657,6 +665,7 @@ impl Petal {
     }
 
     pub(super) fn invalidate_cleanup_jobs(&mut self) {
+        if let Screen::Results(r) = &mut self.screen { r.revoke_ai_collector(); }
         if self.cleanup_panel.ai_busy {
             if let Some(turn) = &mut self.cleanup_panel.ai_turn {
                 turn.phase = AiPhase::Cancelled;
@@ -880,6 +889,72 @@ impl Petal {
             ..Tree::default()
         })
     }
+    /// A pending-list mutation is never permission to execute. Only the native
+    /// confirmation callback may begin Trash, with this exact authority intact.
+    pub(super) fn collector_cleanup_authority(&self) -> Option<(Token, u64)> {
+        if self.cleanup_panel.ai_busy || !self.cleanup_ready() { return None; }
+        let Screen::Results(r) = &self.screen else { return None; };
+        Some((self.cleanup_token()?, r.collector_version))
+    }
+
+    pub(super) fn queue_ai_deletions(&mut self, paths: &[PathBuf], token: Token, cx: &mut Context<Self>) -> String {
+        if self.cleanup_panel.ai_busy || !self.cleanup_current(token) || !self.cleanup_ready() {
+            return t!(Tr::CpAiPendingExpired).into();
+        }
+        let Ok(safety) = rules::SafetyContext::current() else { return t!(Tr::CpAiPendingExpired).into(); };
+        // Normalize case before the Data-volume prefix, including missing
+        // whitelist descendants which cannot be canonicalized yet.
+        let lower = |path: &std::path::Path| {
+            let path = PathBuf::from(path.to_string_lossy().to_ascii_lowercase());
+            path.strip_prefix("/system/volumes/data").map(|relative| std::path::Path::new("/").join(relative)).unwrap_or_else(|_| path.clone())
+        };
+        let mut protected_paths = Vec::new();
+        if let Ok(settings) = &self.cleanup_panel.settings {
+            for path in &settings.whitelist {
+                let Ok(expanded) = safety.expand(path) else { return t!(Tr::CpAiPendingExpired).into(); };
+                protected_paths.push(lower(&expanded));
+                match std::fs::canonicalize(&expanded) {
+                    Ok(real) => protected_paths.push(lower(&real)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(_) => return t!(Tr::CpAiPendingExpired).into(),
+                }
+            }
+        }
+        let Screen::Results(r) = &mut self.screen else { return t!(Tr::CpAiPendingExpired).into(); };
+        let before = r.collector.clone();
+        let mut added = 0;
+        let mut budget = 20_000;
+        for path in paths.iter().take(50) {
+            let policy_path = lower(path);
+            let overlaps = |candidate: &PathBuf| protected_paths.iter().any(|protected| candidate.starts_with(protected) || protected.starts_with(candidate));
+            if overlaps(&policy_path) { continue; }
+            match std::fs::canonicalize(path) {
+                Ok(real) => {
+                    if overlaps(&lower(&real)) || !agent::pending_deletion_path_allowed(&real) || rules::protected(&real, &safety) { continue; }
+                }
+                // A scan-only nomination can still be shown when the file has
+                // gone; it is not execution permission. Other lookup failures
+                // are not reliable evidence and must fail closed.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(_) => continue,
+            }
+            let Some(ix) = r.ai_deletion_node(path, &mut budget) else { continue; };
+            if r.collector.iter().any(|&at| r.tree.is_ancestor_or_self(at, ix)) { continue; }
+            // Do not subsume explicitly selected descendants: revoking an AI
+            // parent must never silently discard a user's manual choices.
+            if r.collector.iter().any(|&at| !r.ai_collector.contains(&at) && r.tree.is_ancestor_or_self(ix, at)) { continue; }
+            r.collect(ix);
+            if r.collector.contains(&ix) {
+                r.ai_collector.retain(|at| r.collector.contains(at));
+                r.ai_collector.insert(ix);
+                added += 1;
+            }
+        }
+        if r.collector != before { self.collector_changed(cx); }
+        cx.notify();
+        tf!(Tr::CpAiQueued, "added" => added, "skipped" => paths.len().saturating_sub(added))
+    }
+
     fn cleanup_ready(&self) -> bool {
         matches!(&self.screen, Screen::Results(r) if !r.trashing && !r.refreshing && !r.out_of_date && !r.deleting_snapshots && r.admin != AdminRead::Reading)
             && self.cleanup_panel.writable()
@@ -1677,12 +1752,11 @@ impl Petal {
                             turn.answer = Some(response.explanation.clone());
                         }
                         let current = draft_eligible && this.cleanup_current(snapshot_token) && this.cleanup_ready();
-                        let has_drafts = !response.proposals.is_empty();
-                        this.cleanup_panel.chat.complete(&response, snapshot_token, current, cx);
+                        let detail = this.ai_response_detail(&response, snapshot_token, current, cx);
+                        this.cleanup_panel.chat.complete_with_detail(&response, snapshot_token, current, Some(&detail), cx);
                         // Keep read-only text but never expose stale draft actions.
                         if current { this.cleanup_panel.response = Some((snapshot_token, response)); }
-                        this.set_ai_phase(AiPhase::Complete,
-                            if !current && has_drafts { t!(Tr::CpAiDraftsExpired) } else { t!(Tr::CpAiSnapshotNotice) }, cx);
+                        this.set_ai_phase(AiPhase::Complete, detail, cx);
                     }
                     Err(error) => this.set_ai_phase(AiPhase::Failed, error, cx),
                 }
@@ -1795,7 +1869,10 @@ impl Petal {
             .gap_3()
             .p_3()
             .when(p.tab == 1 && p.settings.is_ok(), |d| d.p_0().overflow_hidden())
-            .when(p.tab == 2 && !p.chat.has_history(), |d| d.p_6().track_scroll(&p.ai_scroll))
+            .when(p.tab == 2 && !p.chat.has_history(), |d| {
+                d.when(window.viewport_size().width >= px(820.), |d| d.p_6())
+                    .track_scroll(&p.ai_scroll)
+            })
             .when(p.tab == 2 && p.chat.has_history(), |d| d.overflow_hidden());
         if let Err(error) = &p.settings {
             body = body.child(
@@ -2430,7 +2507,11 @@ impl Petal {
         let can_adopt = writable && self.cleanup_ready();
         let can_request = settings.agent.enabled && saved && self.ai_ready() && !p.ai_busy;
         if p.chat.has_history() {
-            let mut view = div().flex().flex_col().flex_1().min_h_0().min_w_0().gap_2()
+            let narrow = window.viewport_size().width < px(820.);
+            // Configuration and wrapped action rows must not consume the chat viewport.
+            let mut view = div().id("chat-actions-scroll").overflow_y_scroll()
+                .max_h(px(if narrow { 112. } else { 160. }))
+                .flex().flex_col().flex_shrink_0().min_h_0().min_w_0().gap_1()
                 .child(row().flex_shrink_0().child(button("chat-analyze", t!(Tr::CpAnalyzeDisk)).when(can_request, |d| d.on_click(cx.listener(|this, _, window, cx| this.request_panel_ai(AgentRequest::Analyze, None, window, cx)))))
                     .child(button("chat-explain", t!(Tr::CpExplainSelection)).when(can_request, |d| d.on_click(cx.listener(|this, _, window, cx| {
                         if let Screen::Results(r) = &this.screen { let ix = r.focus; this.explain_cleanup_node(ix, window, cx); }
@@ -2446,7 +2527,9 @@ impl Petal {
                     .when(can_configure, |d| d.on_click(cx.listener(|this, _, _, cx| this.revoke_ai_consent(false, cx)))));
             }
             if !p.message.is_empty() { view = view.child(div().text_xs().text_color(rgb(WARNING)).child(p.message.clone())); }
-            return view.child(self.render_chat_workspace(can_request, window.viewport_size().width < px(820.), cx));
+            return div().flex().flex_col().flex_1().min_h_0().min_w_0().gap_2()
+                .child(view)
+                .child(self.render_chat_workspace(can_request, narrow, cx));
         }
         let can_explain = can_request
             && matches!(&self.screen, Screen::Results(r)
@@ -2483,6 +2566,7 @@ impl Petal {
             ));
         let mut view = div()
             .w_full().max_w(px(1040.)).mx_auto().flex().flex_col().flex_shrink_0().gap_5().min_w_0()
+            .when(window.viewport_size().width < px(820.), |d| d.gap_3())
             .child(header)
             .child(
                 div().flex().flex_col().gap_3()
@@ -2646,7 +2730,7 @@ impl Petal {
         if p.chat.selected.is_some() || !p.chat.archive.sessions.is_empty() {
             view = view.child(self.render_chat_workspace(can_request, window.viewport_size().width < px(820.), cx));
         } else {
-            view = view.child(self.render_chat_controls(can_request, cx)).child(insights);
+            view = view.child(self.render_chat_pending(cx)).child(self.render_chat_controls(can_request, cx)).child(insights);
         }
         if !p.message.is_empty() {
             view = view.child(

@@ -139,6 +139,8 @@ pub(super) struct ChatState {
     search: Entity<TextInput>,
     scroll: gpui::ScrollHandle,
     history_scroll: gpui::ScrollHandle,
+    pending_page: usize,
+    pending_scroll: gpui::ScrollHandle,
     pub persistence: bool,
     loaded: bool,
     loading: bool,
@@ -230,6 +232,8 @@ impl ChatState {
             search,
             scroll: gpui::ScrollHandle::new(),
             history_scroll: gpui::ScrollHandle::new(),
+            pending_page: 0,
+            pending_scroll: gpui::ScrollHandle::new(),
             persistence: false,
             loaded: false,
             loading: false,
@@ -557,11 +561,23 @@ impl ChatState {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn complete(
         &mut self,
         response: &AgentResponse,
         token: Token,
         actionable: bool,
+        cx: &mut Context<Petal>,
+    ) {
+        self.complete_with_detail(response, token, actionable, None, cx);
+    }
+
+    pub(super) fn complete_with_detail(
+        &mut self,
+        response: &AgentResponse,
+        token: Token,
+        actionable: bool,
+        detail: Option<&str>,
         cx: &mut Context<Petal>,
     ) {
         // Backend validation normally guarantees this. Fail closed without truncating
@@ -590,6 +606,8 @@ impl ChatState {
                 entry.status = ChatStatus::Complete;
                 entry.detail = if !proposals_fit {
                     t!(Tr::CpChatProposalLimit)
+                } else if let Some(detail) = detail {
+                    detail
                 } else if actionable || response.proposals.is_empty() {
                     t!(Tr::CpAiSnapshotNotice)
                 } else {
@@ -910,16 +928,17 @@ impl Petal {
                 match result {
                     Ok(response) => {
                         let actionable = this.cleanup_current(token) && this.cleanup_ready();
+                        let detail = this.ai_response_detail(&response, token, actionable, cx);
                         this.cleanup_panel
                             .chat
-                            .complete(&response, token, actionable, cx);
+                            .complete_with_detail(&response, token, actionable, Some(&detail), cx);
                         if let Some(turn) = &mut this.cleanup_panel.ai_turn {
                             turn.answer = Some(response.explanation.clone());
                         }
                         if actionable {
                             this.cleanup_panel.response = Some((token, response));
                         }
-                        this.set_ai_phase(AiPhase::Complete, t!(Tr::CpAiSnapshotNotice), cx);
+                        this.set_ai_phase(AiPhase::Complete, detail, cx);
                     }
                     Err(error) => this.set_ai_phase(AiPhase::Failed, error, cx),
                 }
@@ -927,6 +946,149 @@ impl Petal {
             .ok();
         })
         .detach();
+    }
+
+    // Both response paths queue nominations before completing the chat and store
+    // local feedback directly on that completed entry. Never infer execution.
+    pub(super) fn ai_response_detail(
+        &mut self,
+        response: &AgentResponse,
+        token: Token,
+        actionable: bool,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let had_actions = !response.proposals.is_empty() || !response.pending_deletions.is_empty();
+        if !response.pending_deletions.is_empty() {
+            if !actionable {
+                return t!(Tr::CpAiPendingExpired).into();
+            }
+            return self.queue_ai_deletions(&response.pending_deletions, token, cx);
+        }
+        if !actionable && had_actions {
+            t!(Tr::CpAiDraftsExpired).into()
+        } else {
+            t!(Tr::CpAiSnapshotNotice).into()
+        }
+    }
+
+    fn chat_pending_ready(&self) -> bool {
+        !self.cleanup_panel.ai_busy && !self.cleanup_panel.cleanup_busy && self.cleanup_ready()
+    }
+
+    fn chat_pending_guard(&mut self, scan: u64, version: u64, cx: &mut Context<Self>) -> bool {
+        if !self.chat_pending_ready() {
+            self.panel_message(t!(Tr::CpAiPendingExpired), cx);
+            return false;
+        }
+        if !matches!(&self.screen, Screen::Results(r) if r.id == scan && r.collector_version == version) {
+            self.panel_message(t!(Tr::CpAiPendingChanged), cx);
+            return false;
+        }
+        true
+    }
+
+    fn remove_chat_pending(&mut self, scan: u64, version: u64, ix: Option<usize>, cx: &mut Context<Self>) {
+        if !self.chat_pending_guard(scan, version, cx) {
+            return;
+        }
+        if let Screen::Results(r) = &mut self.screen {
+            if let Some(ix) = ix {
+                r.collector.retain(|&item| item != ix);
+                r.ai_collector.remove(&ix);
+            } else {
+                r.collector.clear();
+                r.ai_collector.clear();
+            }
+        }
+        self.collector_changed(cx);
+        cx.notify();
+    }
+
+    pub(super) fn render_chat_pending(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        const PAGE_SIZE: usize = 50;
+        let mut panel = div().id("chat-pending").debug_selector(|| "chat-pending".into())
+            .flex().flex_col().flex_shrink_0().min_w_0().gap_1().p_2()
+            .border_1().border_color(rgb(BORDER)).rounded_lg();
+        let title = || div().text_xs().font_weight(FontWeight::SEMIBOLD)
+            .child(t!(Tr::CpAiPendingTitle));
+        let empty = row().min_w_0().child(title())
+            .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpAiPendingEmpty)));
+        let Screen::Results(r) = &self.screen else {
+            return panel.child(empty);
+        };
+        let n = r.collector.len();
+        if n == 0 {
+            return panel.child(empty);
+        }
+        panel = panel.child(title())
+            .child(div().text_xs().text_color(rgb(MUTED)).child(t!(Tr::CpAiPendingHint)));
+        let scan = r.id;
+        let version = r.collector_version;
+        let ready = self.chat_pending_ready();
+        let pages = n.div_ceil(PAGE_SIZE);
+        let page = self.cleanup_panel.chat.pending_page.min(pages - 1);
+        let mut list = div().id("chat-pending-list").max_h(px(120.)).overflow_y_scroll()
+            .track_scroll(&self.cleanup_panel.chat.pending_scroll).flex().flex_col().gap_1();
+        for (position, &ix) in r.collector.iter().enumerate().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
+            let Some(node) = r.tree.nodes.get(ix) else { continue };
+            let path = r.tree.path_of(ix);
+            let reveal = path.clone();
+            list = list.child(div().flex().flex_shrink_0().items_center().min_w_0().gap_2()
+                .child(div().flex_1().min_w_0().flex().flex_col()
+                    .child(div().id(("chat-pending-path", ix))
+                        .debug_selector(move || format!("chat-pending-path-{position}"))
+                        .overflow_x_scroll().text_xs()
+                        .child(path.to_string_lossy().into_owned()))
+                    .child(div().text_xs().text_color(rgb(MUTED))
+                        .child(tf!(Tr::CpAiPendingSize, "size" => format_size(node.size)))))
+                .child(button(("chat-pending-reveal", ix), t!(Tr::RevealInFinder)).text_xs()
+                    .when(!ready, |d| d.opacity(0.45))
+                    .when(ready, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                        if this.chat_pending_guard(scan, version, cx) {
+                            cx.reveal_path(&reveal);
+                        }
+                    }))))
+                .child(button(("chat-pending-remove", ix), "×")
+                    .tooltip(tooltip(t!(Tr::RemoveFromCollector)))
+                    .when(!ready, |d| d.opacity(0.45))
+                    .when(ready, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_chat_pending(scan, version, Some(ix), cx);
+                    })))));
+        }
+        panel = panel.child(list);
+        if pages > 1 {
+            panel = panel.child(row()
+                .child(div().text_xs().child(tf!(Tr::CpAiPendingPage,
+                    "page" => page + 1, "pages" => pages, "n" => n)))
+                .child(button("chat-pending-prev", t!(Tr::CpAiPendingPrevious))
+                    .when(page == 0, |d| d.opacity(0.45))
+                    .when(page > 0, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                        this.cleanup_panel.chat.pending_page = page - 1;
+                        this.cleanup_panel.chat.pending_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        cx.notify();
+                    }))))
+                .child(button("chat-pending-next", t!(Tr::CpAiPendingNext))
+                    .when(page + 1 == pages, |d| d.opacity(0.45))
+                    .when(page + 1 < pages, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                        this.cleanup_panel.chat.pending_page = page + 1;
+                        this.cleanup_panel.chat.pending_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        cx.notify();
+                    })))));
+        }
+        panel.child(row()
+            .child(button("chat-pending-clear", t!(Tr::Clear))
+                .when(!ready, |d| d.opacity(0.45))
+                .when(ready, |d| d.on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_chat_pending(scan, version, None, cx);
+                }))))
+            .child(button("chat-pending-confirm", tf!(Tr::CpAiPendingConfirm, "n" => n))
+                .debug_selector(|| "chat-pending-confirm".into())
+                .when(!ready, |d| d.opacity(0.45))
+                .when(ready, |d| d.on_click(cx.listener(move |this, _, window, cx| {
+                    if this.chat_pending_guard(scan, version, cx) {
+                        this.trash_collected(window, cx);
+                    }
+                })))))
     }
 
     fn decide_chat_proposal(
@@ -1037,10 +1199,10 @@ impl Petal {
         let mut controls = div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .min_w_0()
             .child(
-                row().child(
+                row().min_w_0().child(
                     button("chat-new", t!(Tr::CpChatNew))
                         .when(!p.ai_busy, |d| {
                             d.on_click(cx.listener(|this, _, _, cx| {
@@ -1055,13 +1217,11 @@ impl Petal {
                             }))
                         })
                         .when(p.ai_busy, |d| d.opacity(0.45)),
+                ).child(
+                    div().id("chat-privacy-summary").flex_1().min_w_0().text_xs().text_color(rgb(MUTED))
+                        .tooltip(tooltip(t!(Tr::CpChatPrivacy)))
+                        .child(t!(Tr::CpChatPrivacySummary)),
                 ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(t!(Tr::CpChatPrivacy)),
             )
             .child(
                 row()
@@ -1084,9 +1244,11 @@ impl Petal {
             .is_none_or(|live| !self.ai_current(live.token))
         {
             controls = controls.child(
-                div()
+                div().id("chat-history-readonly")
+                    .min_w_0().truncate()
                     .text_xs()
                     .text_color(rgb(MUTED))
+                    .tooltip(tooltip(t!(Tr::CpChatReadOnly)))
                     .child(t!(Tr::CpChatReadOnly)),
             );
         }
@@ -1141,15 +1303,17 @@ impl Petal {
             .flex_col()
             .gap_2()
             .min_w_0()
+            .when(narrow, |d| d.flex_row().items_start())
             .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(t!(Tr::CpChatHistory)),
-            )
-            .child(chat.search.clone());
+                div().flex().flex_col().gap_1().min_w_0()
+                    .when(narrow, |d| d.w(px(140.)).flex_shrink_0())
+                    .child(div().id("chat-history-label").min_w_0().truncate().text_xs().text_color(rgb(MUTED)).tooltip(tooltip(t!(Tr::CpChatHistory))).child(t!(Tr::CpChatHistory)))
+                    .child(chat.search.clone()),
+            );
         let mut list = div()
             .id("chat-history-list")
+            .min_w_0()
+            .when(narrow, |d| d.flex_1())
             .max_h(px(if narrow { 70. } else { 240. }))
             .overflow_y_scroll()
             .track_scroll(&chat.history_scroll)
@@ -1206,14 +1370,17 @@ impl Petal {
             .id("chat-messages")
             .debug_selector(|| "chat-messages".into())
             .flex_1()
-            .min_h(px(100.))
+            .min_h_0()
             .min_w_0()
             .overflow_y_scroll()
             .track_scroll(&chat.scroll)
             .flex()
             .flex_col()
             .gap_3()
-            .p_3();
+            .p_2()
+            // Keep nominations reachable without reserving space above the composer.
+            // Put them first so scroll-to-bottom still reveals the latest chat turn.
+            .child(self.render_chat_pending(cx));
         if let Some(session) = chat
             .archive
             .sessions
@@ -1387,7 +1554,7 @@ impl Petal {
                 messages = messages.child(message);
             }
         }
-        let mut current = div().flex_1().min_w_0().min_h_0().flex().flex_col().gap_3();
+        let mut current = div().flex_1().min_w_0().min_h_0().flex().flex_col().gap_2();
         if let Some(live) = chat
             .live
             .as_ref()
@@ -1412,7 +1579,7 @@ impl Petal {
                     .sum::<usize>()
             });
             current = current.child(
-                div().id("chat-snapshot-evidence").text_xs().text_color(rgb(MUTED))
+                div().id("chat-snapshot-evidence").flex_shrink_0().text_xs().text_color(rgb(MUTED))
                     .tooltip(tooltip(t!(Tr::CpChatEvidenceHint)))
                     .child(tf!(Tr::CpChatEvidence, "entries" => count, "typed" => typed, "markers" => markers)),
             );
@@ -1427,7 +1594,7 @@ impl Petal {
                 AiPhase::Cancelled => t!(Tr::CpAiPhaseCancelled),
             };
             current = current.child(
-                row()
+                row().flex_shrink_0()
                     .child(ai_badge(
                         label,
                         if matches!(turn.phase, AiPhase::Failed | AiPhase::Cancelled) {
@@ -1466,7 +1633,7 @@ impl Petal {
             .child(self.render_chat_controls(can_send, cx));
         div()
             .flex()
-            .gap_3()
+            .gap_2()
             .min_w_0()
             .flex_1()
             .min_h_0()
@@ -1486,6 +1653,902 @@ impl Petal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "snapshot")]
+    fn pending_fixture(cx: &mut Context<Petal>) -> Petal {
+        let node = |name: &str, kind, parent, children| crate::scan::Node {
+            name: name.into(), size: 100, kind, parent, children, items: 1,
+        };
+        // Synthetic scan only: never create or delete anything in the user's home.
+        let home = crate::rules::SafetyContext::current().unwrap().home;
+        let tree = Tree {
+            root_path: home.clone(),
+            nodes: vec![
+                node("home", Kind::Dir, None, vec![1, 6]),
+                node("Downloads", Kind::Dir, Some(0), vec![2, 3, 5, 7, 9]),
+                node("archive.zip", Kind::File, Some(1), vec![]),
+                node("package", Kind::Dir, Some(1), vec![4]),
+                node("payload.bin", Kind::File, Some(3), vec![]),
+                node("credentials.json", Kind::File, Some(1), vec![]),
+                node(".ssh", Kind::Dir, Some(0), vec![]),
+                node("unsafe-package", Kind::Dir, Some(1), vec![8]),
+                node("credentials.json", Kind::File, Some(7), vec![]),
+                node("opaque", Kind::Other, Some(1), vec![]),
+                node("detached.zip", Kind::File, None, vec![]),
+            ],
+            ..Tree::default()
+        };
+        Petal {
+            screen: Screen::Results(Results::new(tree, vec![], Duration::ZERO,
+                home, ColorBy::Folder, ChartType::Sunburst)),
+            cleanup_panel: PanelState::with_settings(Ok(Settings::default()), cx),
+            menu_bar: crate::menubar::Monitor::new(),
+            focus_handle: cx.focus_handle(),
+            error: None, notice: None, notice_warning: false, notice_version: 0,
+            access: Access::Dismissed, _access_watch: None,
+            color_by: ColorBy::Folder, chart: ChartType::Sunburst,
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn whitelist_pending_fixture(cx: &mut Context<Petal>) -> Petal {
+        let mut petal = pending_fixture(cx);
+        // Unique, nonexistent Downloads paths; never write to the user's home.
+        let r = petal.results().unwrap();
+        r.tree.nodes[3].name = format!(
+            "petal-whitelist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ).into();
+        petal
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_whitelist_tilde_exact_ancestor_and_descendant_skip_package(cx: &mut gpui::TestAppContext) {
+        for relation in ["exact-file", "exact-directory", "ancestor", "descendant", "unscanned-descendant"] {
+            let view = cx.new(whitelist_pending_fixture);
+            view.update(cx, |this, cx| {
+                let token = this.cleanup_token().unwrap();
+                let r = this.results().unwrap();
+                let package = r.tree.path_of(3);
+                let file = r.tree.path_of(4);
+                assert_eq!(std::fs::canonicalize(&file).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+                assert_eq!(r.ai_deletion_node(&package, &mut 20_000), Some(3));
+                let protected = match relation {
+                    "exact-file" | "descendant" => file.clone(),
+                    "exact-directory" => package.clone(),
+                    "ancestor" => package.parent().unwrap().to_path_buf(),
+                    _ => package.join("not-in-scan/keep.bin"),
+                };
+                let home = crate::rules::SafetyContext::current().unwrap().home;
+                let tilde = PathBuf::from("~").join(protected.strip_prefix(home).unwrap());
+                this.cleanup_panel.settings.as_mut().unwrap().whitelist = vec![tilde];
+                let candidate = if relation == "exact-file" { file } else { package };
+                let version = this.results().unwrap().collector_version;
+                assert_eq!(this.queue_ai_deletions(&[candidate], token, cx),
+                    tf!(Tr::CpAiQueued, "added" => 0, "skipped" => 1), "{relation}");
+                let r = this.results().unwrap();
+                assert!(r.collector.is_empty(), "{relation}");
+                assert!(r.ai_collector.is_empty(), "{relation}");
+                assert_eq!(r.collector_version, version);
+                assert!(!r.trashing);
+            });
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_whitelist_missing_mixed_case_data_alias_blocks_both_tree_spellings(cx: &mut gpui::TestAppContext) {
+        for physical_tree in [false, true] {
+            for relation in ["exact", "ancestor", "descendant"] {
+                let view = cx.new(whitelist_pending_fixture);
+                view.update(cx, |this, cx| {
+                    let token = this.cleanup_token().unwrap();
+                    let r = this.results().unwrap();
+                    let logical = r.tree.path_of(3);
+                    let protected = match relation {
+                        "ancestor" => logical.clone(),
+                        "descendant" => logical.join("not-in-scan/keep.bin"),
+                        _ => logical.clone(),
+                    };
+                    let mixed_alias = PathBuf::from(format!("/sYsTeM/vOlUmEs/dAtA{}",
+                        protected.to_string_lossy().to_ascii_uppercase()));
+                    assert_eq!(std::fs::canonicalize(&mixed_alias).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+                    if physical_tree {
+                        r.tree.root_path = std::path::Path::new("/System/Volumes/Data")
+                            .join(r.tree.root_path.strip_prefix("/").unwrap());
+                    }
+                    let candidate_ix = if relation == "ancestor" { 4 } else { 3 };
+                    let candidate = r.tree.path_of(candidate_ix);
+                    assert_eq!(r.ai_deletion_node(&candidate, &mut 20_000), Some(candidate_ix));
+                    this.cleanup_panel.settings.as_mut().unwrap().whitelist = vec![mixed_alias];
+                    assert_eq!(this.queue_ai_deletions(&[candidate], token, cx),
+                        tf!(Tr::CpAiQueued, "added" => 0, "skipped" => 1),
+                        "physical={physical_tree}, relation={relation}");
+                    let r = this.results().unwrap();
+                    assert!(r.collector.is_empty());
+                    assert!(r.ai_collector.is_empty());
+                    assert!(!r.trashing);
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_whitelist_sibling_string_prefix_does_not_block(cx: &mut gpui::TestAppContext) {
+        for shorter_whitelist in [false, true] {
+            let view = cx.new(whitelist_pending_fixture);
+            view.update(cx, |this, cx| {
+                let token = this.cleanup_token().unwrap();
+                let r = this.results().unwrap();
+                let package = r.tree.path_of(3);
+                let sibling = if shorter_whitelist {
+                    r.tree.nodes[3].name = format!("{}-sibling", r.tree.nodes[3].name).into();
+                    package
+                } else {
+                    package.with_file_name(format!("{}-sibling", r.tree.nodes[3].name))
+                };
+                let candidate = r.tree.path_of(3);
+                this.cleanup_panel.settings.as_mut().unwrap().whitelist = vec![sibling];
+                assert_eq!(this.queue_ai_deletions(&[candidate], token, cx),
+                    tf!(Tr::CpAiQueued, "added" => 1, "skipped" => 0));
+                let r = this.results().unwrap();
+                assert_eq!(r.collector, vec![3]);
+                assert_eq!(r.ai_collector, HashSet::from([3]));
+                assert!(!r.trashing);
+            });
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_whitelist_relative_configuration_fails_closed(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(whitelist_pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let package = this.results().unwrap().tree.path_of(3);
+            // Replace only in-memory settings, never validate/save a disk configuration.
+            this.cleanup_panel.settings.as_mut().unwrap().whitelist = vec![PathBuf::from("Downloads/keep")];
+            let version = this.results().unwrap().collector_version;
+            assert_eq!(this.queue_ai_deletions(&[package], token, cx), t!(Tr::CpAiPendingExpired));
+            let r = this.results().unwrap();
+            assert!(r.collector.is_empty());
+            assert!(r.ai_collector.is_empty());
+            assert_eq!(r.collector_version, version);
+            assert!(!r.trashing);
+        });
+    }
+
+    #[cfg(all(feature = "snapshot", target_os = "macos"))]
+    #[gpui::test]
+    fn pending_whitelist_real_root_symlink_cannot_hide_protected_ancestor_or_descendant(cx: &mut gpui::TestAppContext) {
+        let fixture = crate::rules::fixtures::Fixture::new();
+        let real_file = fixture.file("Downloads/package/payload.bin", 0);
+        let real_root = fixture.ctx.home.join("Downloads");
+        let alias = fixture.dir.join("Downloads");
+        std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+        let safety = crate::rules::SafetyContext::current().unwrap();
+        assert!(safety.in_scope(&alias), "fixture must be inside the approved OS temp scope");
+        assert_eq!(std::fs::canonicalize(&alias).unwrap(), real_root);
+        for relation in ["ancestor", "descendant", "whitelist-alias"] {
+            let view = cx.new(|cx| {
+                let mut petal = pending_fixture(cx);
+                let node = |name: &str, kind, parent, children| crate::scan::Node {
+                    name: name.into(), size: 12, kind, parent, children, items: 1,
+                };
+                let r = petal.results().unwrap();
+                r.tree = Tree {
+                    root_path: alias.clone(),
+                    nodes: vec![
+                        node("Downloads", Kind::Dir, None, vec![1]),
+                        node("package", Kind::Dir, Some(0), vec![2]),
+                        node("payload.bin", Kind::File, Some(1), vec![]),
+                    ],
+                    ..Tree::default()
+                };
+                r.requested_root = alias.clone();
+                petal
+            });
+            view.update(cx, |this, cx| {
+                let token = this.cleanup_token().unwrap();
+                let candidate = this.results().unwrap().tree.path_of(1);
+                // Positive control proves the alias is eligible without a whitelist.
+                this.cleanup_panel.settings.as_mut().unwrap().whitelist.clear();
+                assert_eq!(this.queue_ai_deletions(&[candidate.clone()], token, cx),
+                    tf!(Tr::CpAiQueued, "added" => 1, "skipped" => 0));
+                this.results().unwrap().revoke_ai_collector();
+                let protected = match relation {
+                    "ancestor" => real_root.clone(),
+                    "descendant" => real_file.clone(),
+                    _ => {
+                        let second_alias = fixture.dir.join("keep-alias");
+                        std::os::unix::fs::symlink(&real_root, &second_alias).unwrap();
+                        second_alias
+                    }
+                };
+                this.cleanup_panel.settings.as_mut().unwrap().whitelist = vec![protected];
+                let version = this.results().unwrap().collector_version;
+                assert_eq!(this.queue_ai_deletions(&[candidate], token, cx),
+                    tf!(Tr::CpAiQueued, "added" => 0, "skipped" => 1), "{relation}");
+                let r = this.results().unwrap();
+                assert!(r.collector.is_empty());
+                assert!(r.ai_collector.is_empty());
+                assert_eq!(r.collector_version, version);
+                assert!(!r.trashing);
+            });
+        }
+        // Fixture::drop removes only this private OS-temp directory, including aliases.
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_queue_checks_tokens_live_safety_duplicates_and_never_trashes(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let Screen::Results(r) = &this.screen else { panic!("results") };
+            let file = r.tree.path_of(2);
+            let directory = r.tree.path_of(3);
+            let unsafe_paths = vec![r.tree.path_of(0), r.tree.path_of(5), r.tree.path_of(6),
+                r.tree.path_of(7), r.tree.path_of(9), r.tree.root_path.join("Downloads/missing.zip")];
+            for old in [Token { scan: token.scan + 1, ..token },
+                Token { revision: token.revision + 1, ..token },
+                Token { generation: token.generation + 1, ..token }] {
+                assert_eq!(this.queue_ai_deletions(&[file.clone()], old, cx), t!(Tr::CpAiPendingExpired));
+                assert!(this.results().unwrap().collector.is_empty());
+            }
+            assert_eq!(this.queue_ai_deletions(&unsafe_paths, token, cx),
+                tf!(Tr::CpAiQueued, "added" => 0, "skipped" => unsafe_paths.len()));
+            assert!(this.results().unwrap().collector.is_empty());
+            // A stale scan index cannot restore a detached item.
+            this.results().unwrap().tree.nodes[1].children.push(10);
+            let detached = this.results().unwrap().tree.root_path.join("Downloads/detached.zip");
+            assert_eq!(this.queue_ai_deletions(&[detached], token, cx),
+                tf!(Tr::CpAiQueued, "added" => 0, "skipped" => 1));
+            this.results().unwrap().tree.nodes[1].children.retain(|&ix| ix != 10);
+            assert_eq!(this.queue_ai_deletions(&[file.clone(), directory.clone(), file.clone()], token, cx),
+                tf!(Tr::CpAiQueued, "added" => 2, "skipped" => 1));
+            let r = this.results().unwrap();
+            assert_eq!(r.collector.iter().copied().collect::<HashSet<_>>(), HashSet::from([2, 3]));
+            assert_eq!(r.ai_collector, HashSet::from([2, 3]));
+            assert!(!r.trashing, "queueing is not execution authorization");
+            let version = r.collector_version;
+            assert_eq!(this.queue_ai_deletions(&[file.clone(), directory], token, cx),
+                tf!(Tr::CpAiQueued, "added" => 0, "skipped" => 2));
+            assert!(!this.results().unwrap().trashing);
+            // A refreshed row must not remove a newly updated shared selection.
+            assert!(!this.chat_pending_guard(token.scan, version.wrapping_sub(1), cx));
+            assert_eq!(this.cleanup_panel.message, t!(Tr::CpAiPendingChanged));
+            let count = this.results().unwrap().collector.len();
+            this.remove_chat_pending(token.scan, version.wrapping_sub(1), Some(2), cx);
+            assert_eq!(this.results().unwrap().collector.len(), count);
+            // Configuration invalidation must remove AI-only nominations (app.rs contract).
+            this.invalidate_cleanup_jobs();
+            assert!(this.results().unwrap().ai_collector.is_empty());
+            assert!(this.results().unwrap().collector.is_empty());
+            assert_eq!(this.queue_ai_deletions(&[file], token, cx), t!(Tr::CpAiPendingExpired));
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_queue_and_row_actions_reject_busy_and_unready_states(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let file = this.results().unwrap().tree.path_of(2);
+            for busy in 0..7 {
+                this.cleanup_panel.ai_busy = busy == 0;
+                this.cleanup_panel.cleanup_busy = busy == 1;
+                let r = this.results().unwrap();
+                r.trashing = busy == 2;
+                r.refreshing = busy == 3;
+                r.out_of_date = busy == 4;
+                r.admin = if busy == 5 { AdminRead::Reading } else { AdminRead::Done };
+                r.deleting_snapshots = busy == 6;
+                let version = r.collector_version;
+                assert!(!this.chat_pending_ready());
+                assert!(!this.chat_pending_guard(token.scan, version, cx));
+                assert_eq!(this.queue_ai_deletions(&[file.clone()], token, cx), t!(Tr::CpAiPendingExpired));
+                assert!(this.results().unwrap().collector.is_empty());
+            }
+            this.results().unwrap().deleting_snapshots = false;
+            assert!(this.chat_pending_ready());
+            this.queue_ai_deletions(&[file], token, cx);
+            let version = this.results().unwrap().collector_version;
+            for ai_busy in [true, false] {
+                this.cleanup_panel.ai_busy = ai_busy;
+                this.cleanup_panel.cleanup_busy = !ai_busy;
+                this.remove_chat_pending(token.scan, version, Some(2), cx);
+                this.remove_chat_pending(token.scan, version, None, cx);
+                assert_eq!(this.results().unwrap().collector, vec![2]);
+                assert!(!this.results().unwrap().trashing);
+            }
+            this.cleanup_panel.cleanup_busy = false;
+            this.remove_chat_pending(token.scan, version, Some(2), cx);
+            assert!(this.results().unwrap().collector.is_empty());
+            assert!(this.results().unwrap().ai_collector.is_empty());
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_response_feedback_is_saved_after_completion_and_stale_candidates_are_not_queued(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let response = AgentResponse {
+                explanation: "Review only".into(), proposals: vec![],
+                pending_deletions: vec![this.results().unwrap().tree.path_of(2)],
+            };
+            for actionable in [false, true] {
+                this.cleanup_panel.chat.begin("analyze".into(), "analyze".into(), None, true);
+                this.cleanup_panel.ai_turn = Some(AiTurn::new("analyze".into()));
+                let detail = this.ai_response_detail(&response, token, actionable, cx);
+                if !actionable {
+                    assert_eq!(detail, t!(Tr::CpAiPendingExpired));
+                    assert!(this.results().unwrap().collector.is_empty());
+                } else {
+                    assert_eq!(detail, tf!(Tr::CpAiQueued, "added" => 1, "skipped" => 0));
+                }
+                this.cleanup_panel.chat.complete_with_detail(&response, token, actionable, Some(&detail), cx);
+                this.set_ai_phase(AiPhase::Complete, detail.clone(), cx);
+                let chat = &this.cleanup_panel.chat;
+                let session = chat.archive.sessions.iter().find(|s| Some(&s.id) == chat.selected.as_ref()).unwrap();
+                assert_eq!(session.messages.last().unwrap().detail, detail);
+                assert!(!this.results().unwrap().trashing);
+            }
+            let empty = AgentResponse { explanation: "Advice".into(), proposals: vec![], pending_deletions: vec![] };
+            assert_eq!(this.ai_response_detail(&empty, token, false, cx), t!(Tr::CpAiSnapshotNotice));
+            // Manual nominations share the same confirmation list, but not AI ownership.
+            let version = this.results().unwrap().collector_version;
+            this.remove_chat_pending(token.scan, version, None, cx);
+            this.results().unwrap().collect(2);
+            this.collector_changed(cx);
+            this.queue_ai_deletions(&response.pending_deletions, token, cx);
+            assert_eq!(this.results().unwrap().collector, vec![2]);
+            assert!(this.results().unwrap().ai_collector.is_empty());
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_list_pages_keep_the_complete_shared_list_reachable(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(gpui::size(px(1100.), px(850.)), |_, cx| {
+            let mut petal = pending_fixture(cx);
+            petal.cleanup_panel.open = true;
+            petal.cleanup_panel.tab = 2;
+            petal.cleanup_panel.ai_config_expanded = false;
+            let r = petal.results().unwrap();
+            r.collector.clear();
+            for i in 0..51 {
+                let ix = r.tree.nodes.len();
+                r.tree.nodes[1].children.push(ix);
+                r.tree.nodes.push(crate::scan::Node {
+                    name: format!("manual-{i}.zip").into(), size: 100 + i,
+                    kind: Kind::File, parent: Some(1), children: vec![], items: 1,
+                });
+                r.collector.push(ix);
+            }
+            petal
+        });
+        let view = window.root(cx).unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("chat-pending-path-0").is_some());
+        assert!(visual.debug_bounds("chat-pending-path-50").is_none(),
+            "only the current 50-item page is rendered");
+        assert!(visual.debug_bounds("chat-pending-confirm").is_some());
+        view.update(&mut visual, |this, cx| {
+            this.cleanup_panel.chat.pending_page = 1;
+            this.cleanup_panel.chat.pending_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("chat-pending-path-50").is_some(),
+            "the 51st shared manual item remains reachable");
+        assert!(visual.debug_bounds("chat-pending-path-0").is_none());
+        view.read_with(&visual, |this, _| {
+            let Screen::Results(r) = &this.screen else { panic!("results") };
+            assert_eq!(r.collector.len(), 51);
+            assert!(r.ai_collector.is_empty());
+            assert!(!r.trashing);
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn populated_pending_and_messages_scroll_without_displacing_small_window_composer(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for (width, height) in [(520., 640.), (700., 640.)] {
+            let window = cx.open_window(gpui::size(px(width), px(height)), |_, cx| {
+                let mut petal = pending_fixture(cx);
+                petal.cleanup_panel.open = true;
+                petal.cleanup_panel.tab = 2;
+                petal.cleanup_panel.ai_config_expanded = false;
+                let r = petal.results().unwrap();
+                r.collector.clear();
+                for i in 0..51 {
+                    let ix = r.tree.nodes.len();
+                    r.tree.nodes[1].children.push(ix);
+                    r.tree.nodes.push(crate::scan::Node {
+                        name: format!("manual-{i}.zip").into(), size: 100 + i,
+                        kind: Kind::File, parent: Some(1), children: vec![], items: 1,
+                    });
+                    r.collector.push(ix);
+                }
+                let chat = &mut petal.cleanup_panel.chat;
+                chat.begin("Small window question".into(), "Small window question".into(), None, true);
+                chat.complete(
+                    &AgentResponse {
+                        explanation: "## Answer\n\nA paragraph of advice.\n\n".repeat(50),
+                        pending_deletions: vec![], proposals: vec![],
+                    },
+                    Token { scan: 1, revision: 0, generation: 0 },
+                    false, cx,
+                );
+                chat.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                petal
+            });
+            let view = window.root(cx).unwrap();
+            let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            // Explicitly inspect the top of the shared message/pending scroll area.
+            view.update(&mut visual, |this, cx| {
+                this.cleanup_panel.chat.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                cx.notify();
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let composer = visual.debug_bounds("chat-composer").expect("composer exists");
+            assert!(composer.top() >= px(0.) && composer.bottom() <= px(height));
+            assert!(composer.left() >= px(0.) && composer.right() <= px(width));
+            let viewport = view.read_with(&visual, |this, _| this.cleanup_panel.chat.scroll.bounds());
+            assert!(viewport.size.height > px(100.), "messages retain usable scroll space: {width}x{height}, viewport={viewport:?}, composer={composer:?}");
+            let pending = visual.debug_bounds("chat-pending").expect("pending list exists");
+            assert!(pending.top() >= viewport.top() && pending.top() < viewport.bottom());
+            assert!(visual.debug_bounds("chat-pending-path-0").is_some());
+            assert!(visual.debug_bounds("chat-pending-confirm").is_some());
+            view.read_with(&visual, |this, _| {
+                let list = this.cleanup_panel.chat.pending_scroll.bounds();
+                assert!(list.size.height >= px(100.) && list.size.height <= px(120.));
+                assert!(this.cleanup_panel.chat.pending_scroll.max_offset().y > px(0.));
+                assert!(this.cleanup_panel.chat.scroll.max_offset().y > px(0.));
+            });
+            view.update(&mut visual, |this, cx| {
+                this.cleanup_panel.chat.pending_page = 1;
+                this.cleanup_panel.chat.pending_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                cx.notify();
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(visual.debug_bounds("chat-pending-path-50").is_some());
+            assert!(visual.debug_bounds("chat-pending-path-0").is_none());
+            assert_eq!(visual.debug_bounds("chat-composer").unwrap(), composer);
+            view.update(&mut visual, |this, cx| {
+                this.cleanup_panel.chat.scroll.scroll_to_bottom();
+                cx.notify();
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(visual.debug_bounds("chat-composer").unwrap(), composer);
+            view.read_with(&visual, |this, _| {
+                assert!(this.cleanup_panel.chat.scroll.offset().y < px(0.));
+                let Screen::Results(r) = &this.screen else { panic!("results") };
+                assert_eq!(r.collector.len(), 51);
+                assert!(!r.trashing);
+            });
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_invalidation_revokes_only_ai_owned_items_and_bumps_version(cx: &mut gpui::TestAppContext) {
+        for scan_only in [true, false] {
+            let view = cx.new(pending_fixture);
+            view.update(cx, |this, cx| {
+                this.results().unwrap().collect(4);
+                this.collector_changed(cx);
+                let token = this.cleanup_token().unwrap();
+                let file = this.results().unwrap().tree.path_of(2);
+                assert_eq!(this.queue_ai_deletions(&[file], token, cx),
+                    tf!(Tr::CpAiQueued, "added" => 1, "skipped" => 0));
+                let r = this.results().unwrap();
+                assert_eq!(r.collector, vec![4, 2]);
+                assert_eq!(r.ai_collector, HashSet::from([2]));
+                let version = r.collector_version;
+                r.collector_frees.set(Some(200));
+                if scan_only { this.invalidate_scan_cleanup_jobs(); }
+                else { this.invalidate_cleanup_jobs(); }
+                assert!(!this.cleanup_current(token));
+                let r = this.results().unwrap();
+                assert_eq!(r.collector, vec![4], "manual file must survive either invalidation");
+                assert!(r.ai_collector.is_empty());
+                assert_eq!(r.collector_version, version.wrapping_add(1));
+                assert_eq!(r.collector_frees.get(), None);
+                assert!(!r.trashing);
+                r.revoke_ai_collector();
+                assert_eq!(r.collector_version, version.wrapping_add(1), "revocation is idempotent");
+            });
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_ai_parent_cannot_subsume_manually_selected_descendant(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            this.results().unwrap().collect(4);
+            this.collector_changed(cx);
+            let token = this.cleanup_token().unwrap();
+            let parent = this.results().unwrap().tree.path_of(3);
+            let version = this.results().unwrap().collector_version;
+            assert_eq!(this.queue_ai_deletions(&[parent], token, cx),
+                tf!(Tr::CpAiQueued, "added" => 0, "skipped" => 1));
+            let r = this.results().unwrap();
+            assert_eq!(r.collector, vec![4]);
+            assert!(r.ai_collector.is_empty());
+            assert_eq!(r.collector_version, version);
+            this.invalidate_scan_cleanup_jobs();
+            assert_eq!(this.results().unwrap().collector, vec![4]);
+            assert_eq!(this.results().unwrap().collector_version, version);
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_manual_parent_replaces_ai_child_and_survives_invalidation(cx: &mut gpui::TestAppContext) {
+        for scan_only in [true, false] {
+            let view = cx.new(pending_fixture);
+            view.update(cx, |this, cx| {
+                let token = this.cleanup_token().unwrap();
+                let child = this.results().unwrap().tree.path_of(4);
+                assert_eq!(this.queue_ai_deletions(&[child], token, cx),
+                    tf!(Tr::CpAiQueued, "added" => 1, "skipped" => 0));
+                assert_eq!(this.results().unwrap().ai_collector, HashSet::from([4]));
+                // Use the real manual selection path, including ownership reconciliation.
+                this.collect_items(&[3], cx);
+                let r = this.results().unwrap();
+                assert_eq!(r.collector, vec![3]);
+                assert!(r.ai_collector.is_empty());
+                let version = r.collector_version;
+                if scan_only { this.invalidate_scan_cleanup_jobs(); }
+                else { this.invalidate_cleanup_jobs(); }
+                let r = this.results().unwrap();
+                assert_eq!(r.collector, vec![3]);
+                assert!(r.ai_collector.is_empty());
+                assert_eq!(r.collector_version, version);
+                assert!(!r.trashing);
+            });
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_invalidation_preserves_confirmed_trashing_selection(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let path = this.results().unwrap().tree.path_of(2);
+            this.queue_ai_deletions(&[path], token, cx);
+            let r = this.results().unwrap();
+            let version = r.collector_version;
+            r.collector_frees.set(Some(100));
+            // State-only simulation: never call the execution path.
+            r.trashing = true;
+            this.invalidate_scan_cleanup_jobs();
+            this.invalidate_cleanup_jobs();
+            let r = this.results().unwrap();
+            assert_eq!(r.collector, vec![2]);
+            assert_eq!(r.ai_collector, HashSet::from([2]));
+            assert_eq!(r.collector_version, version);
+            assert_eq!(r.collector_frees.get(), Some(100));
+            r.trashing = false;
+            r.revoke_ai_collector();
+            assert!(r.collector.is_empty());
+            assert!(r.ai_collector.is_empty());
+            assert_eq!(r.collector_version, version.wrapping_add(1));
+            assert_eq!(r.collector_frees.get(), Some(0));
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_data_volume_logical_paths_resolve_exactly_once(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let r = this.results().unwrap();
+            let logical_root = r.tree.root_path.clone();
+            let logical = r.tree.path_of(2);
+            let physical_root = std::path::Path::new("/System/Volumes/Data")
+                .join(logical_root.strip_prefix("/").unwrap());
+            r.tree.root_path = physical_root.clone();
+            let physical = r.tree.path_of(2);
+            assert_eq!(r.shown_path(2), logical);
+            assert_eq!(r.ai_deletion_node(&logical, &mut 20_000), Some(2));
+            assert_eq!(r.ai_deletion_node(&physical, &mut 20_000), Some(2));
+            let double_prefix = std::path::Path::new("/System/Volumes/Data")
+                .join(physical.strip_prefix("/").unwrap());
+            for missing in [double_prefix, physical_root.join("Downloads/archive.zip.extra"),
+                physical_root.join("Downloads/missing.zip"),
+                logical_root.join("Downloads/../Downloads/archive.zip"),
+                PathBuf::from("Downloads/archive.zip")] {
+                assert_eq!(r.ai_deletion_node(&missing, &mut 20_000), None, "{}", missing.display());
+            }
+            assert_eq!(this.queue_ai_deletions(&[logical, physical], token, cx),
+                tf!(Tr::CpAiQueued, "added" => 1, "skipped" => 1));
+            assert_eq!(this.results().unwrap().collector, vec![2]);
+            assert_eq!(this.results().unwrap().ai_collector, HashSet::from([2]));
+            assert!(!this.results().unwrap().trashing);
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_fulltree_protected_descendants_and_unreadable_ranges_fail_closed(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let r = this.results().unwrap();
+            let parent = r.tree.path_of(3);
+            let safe_child = r.tree.nodes[4].clone();
+            // A safe nominated folder must be rejected for ANY protected descendant,
+            // irrespective of what the AI snapshot happened to sample.
+            for name in ["credentials.json", ".env", "private.key", "nested.app", "nested.bundle", ".ssh"] {
+                r.tree.nodes[4].name = name.into();
+                assert_eq!(r.ai_deletion_node(&parent, &mut 20_000), None, "{name}");
+            }
+            r.tree.nodes[4] = safe_child.clone();
+            r.tree.nodes[4].kind = Kind::Other;
+            assert_eq!(r.ai_deletion_node(&parent, &mut 20_000), None);
+            r.tree.nodes[4] = safe_child.clone();
+            r.tree.nodes[4].parent = Some(1);
+            assert_eq!(r.ai_deletion_node(&parent, &mut 20_000), None, "broken descendant chain");
+            r.tree.nodes[4] = safe_child;
+            assert_eq!(r.ai_deletion_node(&parent, &mut 20_000), Some(3));
+            for whole in [true, false] {
+                for unreadable in [parent.clone(), parent.join("not-in-snapshot"), r.tree.path_of(1)] {
+                    r.tree.unreadable = vec![crate::scan::Unreadable { path: unreadable, whole, errors: 1 }];
+                    assert_eq!(r.ai_deletion_node(&parent, &mut 20_000), None);
+                }
+            }
+            // A sibling with a shared string prefix is not an ancestor/descendant.
+            r.tree.unreadable = vec![crate::scan::Unreadable {
+                path: r.tree.path_of(1).join("package-sibling"), whole: true, errors: 1,
+            }];
+            assert_eq!(r.ai_deletion_node(&parent, &mut 20_000), Some(3));
+            r.tree.unreadable.clear();
+            // Repeat against a Data-volume tree: unreadable paths are physical.
+            let physical_root = std::path::Path::new("/System/Volumes/Data")
+                .join(r.tree.root_path.strip_prefix("/").unwrap());
+            r.tree.root_path = physical_root;
+            r.tree.unreadable.push(crate::scan::Unreadable {
+                path: r.tree.path_of(3).join("unseen"), whole: false, errors: 1,
+            });
+            assert_eq!(r.ai_deletion_node(&parent, &mut 20_000), None);
+            assert_eq!(this.queue_ai_deletions(&[parent], token, cx),
+                tf!(Tr::CpAiQueued, "added" => 0, "skipped" => 1));
+            assert!(this.results().unwrap().collector.is_empty());
+            assert!(this.results().unwrap().ai_collector.is_empty());
+            assert!(!this.results().unwrap().trashing);
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_queue_enforces_fifty_paths_and_shared_fulltree_budget(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let r = this.results().unwrap();
+            let mut paths = Vec::new();
+            for i in 0..51 {
+                let ix = r.tree.nodes.len();
+                r.tree.nodes.push(crate::scan::Node {
+                    name: format!("limit-{i}.zip").into(), size: 1, kind: Kind::File,
+                    parent: Some(1), children: vec![], items: 1,
+                });
+                r.tree.nodes[1].children.push(ix);
+                paths.push(r.tree.path_of(ix));
+            }
+            let omitted = r.tree.find(&paths[50]).unwrap();
+            assert_eq!(this.queue_ai_deletions(&paths, token, cx),
+                tf!(Tr::CpAiQueued, "added" => 50, "skipped" => 1));
+            let r = this.results().unwrap();
+            assert_eq!(r.collector.len(), 50);
+            assert_eq!(r.ai_collector.len(), 50);
+            assert!(!r.collector.contains(&omitted));
+            assert!(!r.trashing);
+        });
+        let view = cx.new(pending_fixture);
+        view.update(cx, |this, cx| {
+            let token = this.cleanup_token().unwrap();
+            let r = this.results().unwrap();
+            // Folder + 19,998 files costs 19,999 visits, leaving exactly one
+            // visit for archive.zip. The third nomination must fail closed.
+            for i in 0..19_997 {
+                let ix = r.tree.nodes.len();
+                r.tree.nodes.push(crate::scan::Node {
+                    name: format!("budget-{i}.bin").into(), size: 1, kind: Kind::File,
+                    parent: Some(3), children: vec![], items: 1,
+                });
+                r.tree.nodes[3].children.push(ix);
+            }
+            let directory = r.tree.path_of(3);
+            let file = r.tree.path_of(2);
+            let mut insufficient = 19_998;
+            assert_eq!(r.ai_deletion_node(&directory, &mut insufficient), None);
+            let mut exact = 19_999;
+            assert_eq!(r.ai_deletion_node(&directory, &mut exact), Some(3));
+            assert_eq!(exact, 0);
+            // Turn the unrelated opaque node into another eligible file.
+            r.tree.nodes[9].kind = Kind::File;
+            let last = r.tree.path_of(9);
+            assert_eq!(r.ai_deletion_node(&last, &mut 0), None);
+            assert_eq!(this.queue_ai_deletions(&[directory, file, last], token, cx),
+                tf!(Tr::CpAiQueued, "added" => 2, "skipped" => 1));
+            let r = this.results().unwrap();
+            assert_eq!(r.collector, vec![3, 2]);
+            assert_eq!(r.ai_collector, HashSet::from([3, 2]));
+            assert!(!r.trashing);
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    const PENDING_AUTHORITY_CHANGES: &[&str] = &[
+        "collector", "scan", "revision", "generation", "scan-invalidation", "config-invalidation",
+        "ai-busy", "cleanup-busy", "key-busy", "test-busy", "refreshing", "out-of-date",
+        "admin-reading", "deleting-snapshots", "settings-error", "trashing", "no-scan",
+    ];
+
+    #[cfg(feature = "snapshot")]
+    fn change_pending_authority(this: &mut Petal, change: &str, cx: &mut Context<Petal>) {
+        match change {
+            "collector" => this.collect_items(&[4], cx),
+            "scan" => {
+                let r = this.results().unwrap();
+                r.id = r.id.wrapping_add(1);
+            }
+            "revision" => this.cleanup_panel.revision = this.cleanup_panel.revision.wrapping_add(1),
+            "generation" => this.cleanup_panel.generation = this.cleanup_panel.generation.wrapping_add(1),
+            "scan-invalidation" => this.invalidate_scan_cleanup_jobs(),
+            "config-invalidation" => this.invalidate_cleanup_jobs(),
+            "ai-busy" => this.cleanup_panel.ai_busy = true,
+            "cleanup-busy" => this.cleanup_panel.cleanup_busy = true,
+            "key-busy" => this.cleanup_panel.key_busy = true,
+            "test-busy" => this.cleanup_panel.test_busy = true,
+            "refreshing" => this.results().unwrap().refreshing = true,
+            "out-of-date" => this.results().unwrap().out_of_date = true,
+            "admin-reading" => this.results().unwrap().admin = AdminRead::Reading,
+            "deleting-snapshots" => this.results().unwrap().deleting_snapshots = true,
+            "settings-error" => this.cleanup_panel.settings = Err("synthetic settings error".into()),
+            "trashing" => this.results().unwrap().trashing = true,
+            "no-scan" => this.screen = Screen::Start(vec![]),
+            _ => panic!("unknown authority change: {change}"),
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_confirmation_authority_checks_tokens_version_and_all_busy_guards(cx: &mut gpui::TestAppContext) {
+        for &change in PENDING_AUTHORITY_CHANGES {
+            let view = cx.new(pending_fixture);
+            view.update(cx, |this, cx| {
+                this.collect_items(&[2], cx);
+                let captured = this.collector_cleanup_authority().expect("ready fixture");
+                assert_eq!(captured, (this.cleanup_token().unwrap(), this.results().unwrap().collector_version));
+                change_pending_authority(this, change, cx);
+                let current = this.collector_cleanup_authority();
+                assert_ne!(current, Some(captured), "{change} must revoke captured authority");
+                if matches!(change, "collector" | "scan" | "revision" | "generation" |
+                    "scan-invalidation" | "config-invalidation") {
+                    assert!(current.is_some(), "{change} changes authority without making the UI busy");
+                } else {
+                    assert!(current.is_none(), "{change} must deny authority entirely");
+                }
+            });
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn pending_prompt_fixture(cx: &mut Context<Petal>) -> Petal {
+        let mut petal = pending_fixture(cx);
+        // No filesystem setup. Even prompt details refer only to synthetic paths,
+        // not the fixture's otherwise plausible Downloads/archive.zip.
+        let r = petal.results().unwrap();
+        r.tree.root_path = r.tree.root_path.join("Downloads/petal-regression-native-prompt-not-created");
+        r.requested_root = r.tree.root_path.clone();
+        petal.collect_items(&[2], cx);
+        petal
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_native_prompt_is_not_opened_without_ready_authority(cx: &mut gpui::TestAppContext) {
+        for &change in PENDING_AUTHORITY_CHANGES {
+            if matches!(change, "collector" | "scan" | "revision" | "generation" |
+                "scan-invalidation" | "config-invalidation") { continue; }
+            let window = cx.add_window(|_, cx| pending_prompt_fixture(cx));
+            window.update(cx, |this, window, cx| {
+                change_pending_authority(this, change, cx);
+                assert_eq!(this.collector_cleanup_authority(), None, "{change}");
+                this.trash_collected(window, cx);
+            }).unwrap();
+            assert!(!cx.has_pending_prompt(), "{change}: reject before asking for confirmation");
+            cx.run_until_parked();
+            window.update(cx, |this, window, _| {
+                if let Screen::Results(r) = &this.screen {
+                    assert_eq!(r.trashing, change == "trashing", "{change}: execution state unchanged");
+                    assert!(r.trashed.is_none());
+                    assert_eq!(r.collector, vec![2]);
+                    assert!(r.tree.is_attached(2));
+                }
+                window.remove_window();
+            }).unwrap();
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_native_prompt_cancellation_never_enters_trashing(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, cx| pending_prompt_fixture(cx));
+        let captured = window.update(cx, |this, window, cx| {
+            let captured = this.collector_cleanup_authority().unwrap();
+            this.trash_collected(window, cx);
+            assert!(!this.results().unwrap().trashing);
+            captured
+        }).unwrap();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer(t!(Tr::Cancel));
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        window.update(cx, |this, window, _| {
+            assert_eq!(this.collector_cleanup_authority(), Some(captured));
+            let r = this.results().unwrap();
+            assert!(!r.trashing);
+            assert!(r.trashed.is_none());
+            assert_eq!(r.collector, vec![2]);
+            assert!(r.tree.is_attached(2));
+            window.remove_window();
+        }).unwrap();
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_native_prompt_stale_confirmation_never_enters_trashing(cx: &mut gpui::TestAppContext) {
+        for &change in PENDING_AUTHORITY_CHANGES {
+            // Already-trashing is a helper-only test: do not set the very state
+            // this callback test is intended to prove it never enters.
+            if change == "trashing" { continue; }
+            let window = cx.add_window(|_, cx| pending_prompt_fixture(cx));
+            window.update(cx, |this, window, cx| {
+                let captured = this.collector_cleanup_authority().unwrap();
+                this.trash_collected(window, cx);
+                assert!(!this.results().unwrap().trashing);
+                change_pending_authority(this, change, cx);
+                // Safety invariant: NEVER answer yes to an unchanged authority.
+                assert_ne!(this.collector_cleanup_authority(), Some(captured), "{change}");
+            }).unwrap();
+            assert!(cx.has_pending_prompt(), "{change}: real prompt path must be exercised");
+            cx.simulate_prompt_answer(t!(Tr::MoveToTrashButton));
+            cx.run_until_parked();
+            assert!(!cx.has_pending_prompt());
+            window.update(cx, |this, window, _| {
+                assert!(this.notice_warning, "{change}: confirmation callback rejected stale authority");
+                if let Screen::Results(r) = &this.screen {
+                    assert!(!r.trashing, "{change}");
+                    assert!(r.trashed.is_none(), "{change}");
+                    assert!(r.tree.is_attached(2), "{change}: original item was not detached");
+                    assert!(r.collector.contains(&2), "{change}: manual selection survives");
+                } else {
+                    assert_eq!(change, "no-scan");
+                }
+                window.remove_window();
+            }).unwrap();
+        }
+    }
 
     struct ThreadWake(std::thread::Thread);
     impl std::task::Wake for ThreadWake {
@@ -1788,6 +2851,7 @@ mod tests {
             chat.complete(
                 &AgentResponse {
                     explanation: "answer".into(),
+                    pending_deletions: vec![],
                     proposals: vec![],
                 },
                 token,
@@ -1877,6 +2941,7 @@ mod tests {
             chat.complete(
                 &AgentResponse {
                     explanation: "\u{0001}".repeat(60 * 1024),
+                    pending_deletions: vec![],
                     proposals: vec![],
                 },
                 token,
@@ -1895,6 +2960,7 @@ mod tests {
             chat.complete(
                 &AgentResponse {
                     explanation: "answer retained".into(),
+                    pending_deletions: vec![],
                     proposals: vec![rule],
                 },
                 token,
@@ -1949,6 +3015,7 @@ mod tests {
             chat.complete(
                 &AgentResponse {
                     explanation: "late response".into(),
+                    pending_deletions: vec![],
                     proposals: vec![],
                 },
                 Token {
@@ -2067,6 +3134,7 @@ mod tests {
                 panel.chat.complete(
                     &AgentResponse {
                         explanation: "# Heading\n\n**Answer one**\n\n- first\n- second".into(),
+                        pending_deletions: vec![],
                         proposals: vec![],
                     },
                     Token {
@@ -2083,6 +3151,7 @@ mod tests {
                 panel.chat.complete(
                     &AgentResponse {
                         explanation: "Answer two".into(),
+                        pending_deletions: vec![],
                         proposals: vec![],
                     },
                     Token {
@@ -2203,6 +3272,7 @@ mod tests {
                 this.cleanup_panel.chat.complete(
                     &AgentResponse {
                         explanation: "## New answer\n\nLong answer paragraph.\n\n".repeat(50),
+                        pending_deletions: vec![],
                         proposals: vec![],
                     },
                     Token {
@@ -2238,6 +3308,7 @@ mod tests {
                 this.cleanup_panel.chat.complete(
                     &AgentResponse {
                         explanation: "Final answer.\n\n".repeat(50),
+                        pending_deletions: vec![],
                         proposals: vec![],
                     },
                     Token {
@@ -2286,6 +3357,7 @@ mod tests {
             panel.chat.complete(
                 &AgentResponse {
                     explanation: "review 20 rules".into(),
+                    pending_deletions: vec![],
                     proposals,
                 },
                 token,
@@ -2346,6 +3418,7 @@ mod tests {
             panel.chat.complete(
                 &AgentResponse {
                     explanation: "fresh batch".into(),
+                    pending_deletions: vec![],
                     proposals: std::mem::take(&mut rules),
                 },
                 token,
@@ -2465,6 +3538,7 @@ mod tests {
             this.cleanup_panel.chat.complete(
                 &AgentResponse {
                     explanation: "pending rule".into(),
+                    pending_deletions: vec![],
                     proposals: vec![rule],
                 },
                 Token {
@@ -2549,6 +3623,7 @@ mod tests {
                 });
                 let response = AgentResponse {
                     explanation: "answer".into(),
+                    pending_deletions: vec![],
                     proposals: vec![],
                 };
                 let token = Token {

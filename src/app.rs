@@ -348,6 +348,8 @@ struct Results {
     chart: ChartType,
     chart_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     collector: Vec<usize>,
+    /// AI-only nominations; revoked when their scan/configuration changes.
+    ai_collector: HashSet<usize>,
     list_scroll: UniformListScrollHandle,
     elapsed: Duration,
     /// What the user asked to scan; for the startup disk this is `/`, while the tree
@@ -441,6 +443,7 @@ impl Results {
             chart,
             chart_bounds: Rc::default(),
             collector: Vec::new(),
+            ai_collector: HashSet::new(),
             list_scroll: UniformListScrollHandle::new(),
             elapsed,
             requested_root,
@@ -617,6 +620,48 @@ impl Results {
         self.collector.retain(|&c| !tree.is_ancestor_or_self(ix, c));
         self.collector.push(ix);
         self.collector_frees.set(None);
+    }
+
+    /// Resolve logical snapshot paths against this full, current tree. Snapshot
+    /// node IDs are deliberately never used here. Bound subtree checks and fail
+    /// closed rather than trusting a sampled directory with unknown descendants.
+    fn ai_deletion_node(&self, path: &std::path::Path, budget: &mut usize) -> Option<usize> {
+        if !crate::agent::pending_deletion_path_allowed(path) { return None; }
+        let mapped;
+        let path = if self.tree.root_path.starts_with("/System/Volumes/Data") && !path.starts_with("/System/Volumes/Data") {
+            mapped = std::path::Path::new("/System/Volumes/Data").join(path.strip_prefix("/").ok()?);
+            mapped.as_path()
+        } else { path };
+        let ix = self.tree.find(path)?;
+        if ix == Tree::ROOT || !self.tree.is_attached(ix) || findings::is_inside_bundle(&self.tree, ix) { return None; }
+        if self.tree.unreadable.iter().any(|entry| entry.path.starts_with(path) || path.starts_with(&entry.path)) { return None; }
+        let safety = crate::rules::SafetyContext::current().ok()?;
+        let mut stack = vec![(ix, path.to_path_buf())];
+        while let Some((at, location)) = stack.pop() {
+            *budget = budget.checked_sub(1)?;
+            let node = self.tree.nodes.get(at)?;
+            if node.kind == Kind::Other || !crate::agent::pending_deletion_path_allowed(&location) || crate::rules::protected(&location, &safety) { return None; }
+            if node.children.len() > *budget { return None; }
+            for &child in &node.children {
+                let child_node = self.tree.nodes.get(child)?;
+                if child_node.parent != Some(at) { return None; }
+                stack.push((child, location.join(child_node.name.as_ref())));
+            }
+        }
+        Some(ix)
+    }
+
+    fn revoke_ai_collector(&mut self) {
+        // Once explicitly confirmed, keep the captured selection until execution
+        // finishes, including failures. Invalidation cannot rewrite that consent.
+        if self.trashing || self.ai_collector.is_empty() { return; }
+        let before = self.collector.len();
+        self.collector.retain(|ix| !self.ai_collector.contains(ix));
+        self.ai_collector.clear();
+        if self.collector.len() != before {
+            self.collector_version = self.collector_version.wrapping_add(1);
+            self.collector_frees.set(if self.collector.is_empty() { Some(0) } else { None });
+        }
     }
 
     fn collected_size(&self) -> u64 {
@@ -1604,7 +1649,8 @@ impl Petal {
     fn collector_changed(&mut self, cx: &mut Context<Self>) {
         let Some(r) = self.results() else { return };
         r.trashed = None;
-        r.collector_version += 1;
+        r.ai_collector.retain(|ix| r.collector.contains(ix));
+        r.collector_version = r.collector_version.wrapping_add(1);
         r.collector_frees.set(None);
         let version = r.collector_version;
         let results_id = r.id;
@@ -1780,7 +1826,7 @@ impl Petal {
     }
 
     fn trash_collected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cleanup_panel.cleanup_busy { return; }
+        let Some(authority) = self.collector_cleanup_authority() else { return };
         let Some(r) = self.results() else { return };
         if r.collector.is_empty() {
             return;
@@ -1794,13 +1840,15 @@ impl Petal {
         };
         // Quote what deleting really frees (clones and hard links shared with files outside
         // the selection stay), once it's known.
-        let detail = match r.collector_frees.get() {
+        let summary = match r.collector_frees.get() {
             Some(frees) => tf!(Tr::TrashFreesUp, "freed" => format_size(frees)),
             None => tf!(
                 Tr::TrashFreesUpTentative,
                 "freed" => format_size(r.collected_size())
             ),
         };
+        let details = items.iter().map(|&ix| format!("{} · {}", r.shown_path(ix).display(), format_size(r.tree.nodes[ix].size))).collect::<Vec<_>>().join("\n");
+        let detail = format!("{summary}\n\n{}\n\n{details}", t!(Tr::CpAiPendingHint));
         let what = if items.len() == 1 {
             format!("“{}”", r.tree.nodes[items[0]].name)
         } else {
@@ -1821,7 +1869,10 @@ impl Petal {
                 return;
             }
             let started = this.update(cx, |this, cx| {
-                if this.cleanup_panel.cleanup_busy { return false; }
+                if this.collector_cleanup_authority() != Some(authority) {
+                    this.show_warning(t!(Tr::CpAiPendingChanged).into(), cx);
+                    return false;
+                }
                 let Some(r) = this.results() else { return false };
                 if r.id != results_id || r.collector_version != collector_version || r.trashing { return false; }
                 r.trashing = true;
@@ -1865,6 +1916,7 @@ impl Petal {
                             }
                             r.update_findings(&set, &touched);
                             r.collector.clear();
+                            r.ai_collector.clear();
                             r.collector_frees.set(None);
                             r.trashed = Some(Trashed { what, frees });
                             r.chart_hover = None;
