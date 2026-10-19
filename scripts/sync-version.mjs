@@ -22,6 +22,14 @@ function update(file, pattern, replace) {
   writeFileSync(path, text.replace(pattern, replace));
 }
 
+// Keep the npm lockfile consistent with the package version as well. Release
+// validation checks both fields, and Changesets only bumps package.json.
+const npmLockPath = `${root}package-lock.json`;
+const npmLock = JSON.parse(readFileSync(npmLockPath, "utf8"));
+npmLock.version = version;
+npmLock.packages[""].version = version;
+writeFileSync(npmLockPath, `${JSON.stringify(npmLock, null, 2)}\n`);
+
 // The [package] version: the first `version = "…"` line, before any dependency tables.
 update("Cargo.toml", /^version = "[^"]*"/m, `version = "${version}"`);
 update("Cargo.lock", /(\[\[package\]\]\nname = "petal"\nversion = )"[^"]*"/, `$1"${version}"`);

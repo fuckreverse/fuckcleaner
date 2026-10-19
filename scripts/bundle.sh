@@ -23,7 +23,7 @@ APP=dist/Petal.app
 # builds to recompile.
 # (The encoded form, separated by 0x1f, copes with spaces in the paths.)
 export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=/build"$'\x1f'"--remap-path-prefix=$PWD=/petal"
-cargo build --release --target-dir target/bundle
+cargo build --release --locked --target-dir target/bundle
 rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/bundle/release/petal "$APP/Contents/MacOS/petal"
 [[ -f packaging/AppIcon.icns ]] || python3 scripts/make-icon.py packaging

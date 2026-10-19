@@ -1,8 +1,8 @@
 name: Changesets
 
 # Keeps a "Version Packages" pull request open while there are unreleased changesets on main.
-# Merging it bumps the version everywhere and writes CHANGELOG.md; the DMG is still built,
-# notarised and uploaded by hand (scripts/bundle.sh --dmg).
+# Merging it bumps the version everywhere and writes CHANGELOG.md.
+# Push the matching vX.Y.Z tag to build and publish the DMGs with release.yml.
 
 on:
   push:

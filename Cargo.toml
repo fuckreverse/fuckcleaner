@@ -1,10 +1,10 @@
 [package]
 name = "petal"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "A fast, exact disk-space explorer for macOS with a live sunburst chart, built with GPUI"
 license = "MIT"
-repository = "https://github.com/henrydennis/petal"
+repository = "https://github.com/fuckreverse/fuckcleaner"
 readme = "README.md"
 keywords = ["disk-usage", "macos", "gpui", "sunburst", "apfs"]
 categories = ["filesystem", "visualization"]

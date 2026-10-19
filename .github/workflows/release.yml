@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches the package versions
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ['TAG']
+          if os.environ['REF_TYPE'] != 'tag' or not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+              raise SystemExit('Run this workflow on a vX.Y.Z release tag, not a branch.')
+          version = tag[1:]
+          cargo = tomllib.loads(Path('Cargo.toml').read_text())
+          lock = tomllib.loads(Path('Cargo.lock').read_text())
+          package = json.loads(Path('package.json').read_text())
+          npm_lock = json.loads(Path('package-lock.json').read_text())
+          versions = {
+              'Cargo.toml': cargo['package']['version'],
+              'Cargo.lock': next(p['version'] for p in lock['package'] if p['name'] == 'petal'),
+              'package.json': package['version'],
+              'package-lock.json': npm_lock['version'],
+              'package-lock.json root': npm_lock['packages']['']['version'],
+          }
+          for source, actual in versions.items():
+              if actual != version:
+                  raise SystemExit(f'{source}: {actual} does not match tag {tag}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+
+  build:
+    name: Build macOS (${{ matrix.arch }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      VERSION: ${{ needs.validate.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+          workspaces: |
+            . -> target
+            . -> target/bundle
+      - name: Check the runner architecture
+        run: test "$(uname -m)" = "$ARCH"
+      - name: Run tests, including the GPUI test platform
+        run: cargo test --release --locked --features snapshot
+      - name: Build the application and disk image
+        run: bash scripts/bundle.sh --dmg
+      - name: Verify and package release assets
+        run: |
+          codesign --verify --deep --strict dist/Petal.app
+          hdiutil verify dist/Petal.dmg
+          lipo -verify_arch "$ARCH" dist/Petal.app/Contents/MacOS/petal
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/Petal.app/Contents/Info.plist)" = "$VERSION"
+          mv dist/Petal.dmg "dist/Petal-${VERSION}-${ARCH}.dmg"
+          ditto -c -k --sequesterRsrc --keepParent dist/Petal.app "dist/Petal-${VERSION}-${ARCH}.zip"
+          cd dist
+          shasum -a 256 "Petal-${VERSION}-${ARCH}.dmg" "Petal-${VERSION}-${ARCH}.zip" > "SHA256SUMS-${ARCH}.txt"
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: petal-${{ matrix.arch }}
+          path: |
+            dist/Petal-*.dmg
+            dist/Petal-*.zip
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: petal-*
+          merge-multiple: true
+          path: dist
+      - name: Verify all downloaded assets
+        working-directory: dist
+        run: |
+          sha256sum --check SHA256SUMS-arm64.txt
+          sha256sum --check SHA256SUMS-x86_64.txt
+      - name: Create or resume a draft release
+        run: |
+          cat > release-notes.txt <<'NOTES'
+          ## Downloads
+
+          - **Apple Silicon (M1/M2/M3/M4 and newer):** download the `arm64.dmg`.
+          - **Intel Macs:** download the `x86_64.dmg`.
+          - Open the DMG and drag **Petal.app** to **Applications**. ZIP bundles and SHA-256 checksums are also provided.
+          - Requires **macOS 13 or later**.
+
+          ## Highlights
+
+          - AI can nominate files and directories into a shared pending-deletion list. Review the list and confirm before anything is moved to Trash.
+          - Local safety checks protect system paths, credentials and whitelist entries; stale scan suggestions are revoked.
+          - Includes the AI chat workspace, bilingual interface, menu-bar disk monitor and improved small-window layout.
+
+          ## Signing notice
+
+          These builds are **ad-hoc signed, not Apple Developer ID signed or notarized**. macOS may block the first launch. After verifying the download source, use **System Settings → Privacy & Security → Open Anyway**. If macOS reports the app is damaged because of quarantine, you can remove quarantine from this app only:
+
+          ```bash
+          xattr -dr com.apple.quarantine /Applications/Petal.app
+          ```
+
+          Grant Full Disk Access only if you need to scan protected locations. AI does not delete files directly; deletion always requires your confirmation.
+          NOTES
+          if gh release view "$TAG" --json isDraft >/dev/null 2>&1; then
+            test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true
+          else
+            gh release create "$TAG" --verify-tag --draft --title "Petal ${VERSION}" --notes-file release-notes.txt
+          fi
+      - name: Upload assets and publish
+        run: |
+          gh release upload "$TAG" dist/Petal-*.dmg dist/Petal-*.zip dist/SHA256SUMS-*.txt --clobber
+          gh release edit "$TAG" --draft=false --latest
+          gh release view "$TAG" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
