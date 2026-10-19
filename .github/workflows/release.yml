@@ -101,7 +101,7 @@ jobs:
         run: |
           codesign --verify --deep --strict dist/Petal.app
           hdiutil verify dist/Petal.dmg
-          lipo -verify_arch "$ARCH" dist/Petal.app/Contents/MacOS/petal
+          lipo dist/Petal.app/Contents/MacOS/petal -verify_arch "$ARCH"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/Petal.app/Contents/Info.plist)" = "$VERSION"
           mv dist/Petal.dmg "dist/Petal-${VERSION}-${ARCH}.dmg"
           ditto -c -k --sequesterRsrc --keepParent dist/Petal.app "dist/Petal-${VERSION}-${ARCH}.zip"
